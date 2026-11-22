@@ -1,0 +1,765 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 The RadioFoundry Authors
+// The radio features for the debug link (docs/spec/debuglink.md 3.7, 3.8): the "features" view section (scan, FM
+// extras, battery, beeps, settings) and the RADIO operations that drive them (scan, beep, tone burst, one setting,
+// roaming)
+#include "config.h"
+#include "board.h"
+#include "debuglink/debuglink.h"
+#include "debuglink/debuglink_proto.h"
+#include "radio/beep.h"
+#include "radio/vibe.h"
+#include "radio/mic_gain.h"
+#include "radio/ref_trim.h"
+#include "radio/tx_limit.h"
+#include "radio/pa_keyup.h"
+#include "radio/pa_sweep.h"
+#include "radio/pa_keyrun.h"
+#include "radio/radio_cwid.h"
+#include "radio/radio_keys.h"
+#include "hal_time.h"
+#include "hal_dtmf.h"
+#include "settings/settings.h"
+#include "dmr/sfr.h"
+#include "input/input.h"
+#if CONFIG_KEY_ASSIGN
+#include "input/keyassign.h"
+#include "codeplug/codeplug.h"
+#endif
+#if CONFIG_DMR
+#include "dmr/ambe/ambeVoice.h"
+#if CONFIG_ZONE_SHARE
+#include "dmr/zone_share_api.h"
+#endif
+#endif
+#if CONFIG_GPS
+#include "position/position.h"
+#endif
+#if CONFIG_YSF
+#include <string.h>
+#include "ysf/ysf_codeplug.h"
+#endif
+
+#define DL_SETTING_MIC_GAIN	29u	// SETTING id of the mic gain step (radio/mic_gain.h)
+#define DL_SETTING_ENC_OPTIONS	31u	// SETTING id of the vocoder's encode options (VOCODER_OPT_*)
+#define DL_SETTING_ZS_OFFERS	32u	// SETTING id of zone share offers (zone_share_api.h)
+#define DL_SETTING_REF_TRIM	35u	// SETTING id of the reference trim, ppb two's complement (radio/ref_trim.h)
+#define DL_SETTING_TONES_OFF	36u	// SETTING id of the Settings > Sound tones (radio_settings_t.tones_off)
+#define DL_SETTING_GPS		37u	// SETTING id of Settings > Location > GPS (settings_t.gps, board_t.gps)
+
+static const char *word(uint8_t v, const char *const *names, uint8_t n)
+{
+	return v < n ? names[v] : "?";
+}
+
+// The speaker route of the beeps (section audio; the features section has no room left): which stream played them,
+// their lead-in and the amplifier hang (radio-features.md 4); and the PCM stream's timing, which a speaker test reads to
+// tell a block played late (heard as the sound before it again) from what its microphone does
+void debuglink_view_audio(dl_text_t *t)
+{
+#if CONFIG_BEEP
+	beep_stats_t b;
+	beep_get_stats(&b);
+	dl_text(t, "beep.shared=%u\nbeep.leads=%u\nbeep.warm=%u\nbeep.warms=%u\n", (unsigned)b.shared, (unsigned)b.leads,
+		beep_warm_on(), (unsigned)b.warms);
+	radio_settings_t rs;	// the features section is full: the Sound tones' switches go here
+	radio_get_settings(&rs);
+	dl_text(t, "beep.tones_off=%u\n", rs.tones_off);
+#endif
+	const hal_audio_t *a = board.audio;
+	if (a != NULL && a->stream_stats != NULL) {
+		audio_stream_stats_t s;
+		a->stream_stats(&s);
+		dl_text(t, "audio.blocks=%u\naudio.late=%u\naudio.dropped=%u\n", (unsigned)s.blocks, (unsigned)s.late,
+			(unsigned)s.dropped);
+	}
+	(void)t;
+}
+
+// The last PA drive sweep (RADIO op 39): the points it ran and the top level's drive it counted from
+static uint8_t pa_sweep_last_n;
+static uint16_t pa_sweep_last_top;
+// The last PA key run (RADIO op 40): the keys it ran of those asked
+static uint8_t pa_keyrun_last_n, pa_keyrun_last_of;
+#define KEYRUN_RESTART_DELAY_MS	100u
+static bool keyrun_reattach;		// a key run asked for the host port to come back after its reply
+static bool keyrun_restart;		// or for the radio to restart
+
+void debuglink_keyrun_service(void)
+{
+	if (keyrun_restart) {
+		keyrun_restart = false;
+		keyrun_reattach = false;
+		hal_delay_ms(KEYRUN_RESTART_DELAY_MS);	// the reply on its way
+		if (board.system != NULL && board.system->reboot != NULL && radio_get_state() != RS_TX) {
+			(void)board.system->reboot(HAL_REBOOT_NORMAL);
+		}
+	}
+	if (keyrun_reattach) {
+		keyrun_reattach = false;
+		if (board.host_port != NULL && board.host_port->reattach != NULL) {
+			board.host_port->reattach();
+		}
+	}
+}
+
+#if CONFIG_DMR
+static bool keyrun_keyup(const pa_keyup_cfg_t *c)
+{
+	return pa_keyup_set(c);
+}
+
+static bool keyrun_ptt(bool down, uint32_t max_ms)
+{
+	return input_inject_ptt(down, max_ms) == INPUT_INJ_OK;
+}
+
+static bool keyrun_keyed(void)
+{
+	return radio_get_state() == RS_TX;
+}
+#endif
+
+void debuglink_view_radio(const radio_view_t *v, dl_text_t *t)
+{
+	static const char *const kinds[] = { "off", "zone", "vfo", "dual" };
+	static const char *const phases[] = { "listen", "probe", "hold", "resume", "paused" };
+	static const char *const batt[] = { "ok", "low", "critical" };
+	static const char *const resumes[] = { "time", "carrier", "stop" };
+	static const char *const bcls[] = { "off", "carrier", "wrong_tone" };
+	static const char *const voxes[] = { "off", "channel", "all" };
+	radio_settings_t s;
+
+	dl_text(t, "scan.built=%u\n", CONFIG_SCAN);
+	if (board.radio != NULL && board.radio->tx_drive_now != NULL) {
+		dl_text(t, "pa_sweep.last=%u/%u/%u\n", (unsigned)pa_sweep_last_n, (unsigned)pa_sweep_last_top,
+			board.radio->tx_mark != NULL ? 1u : 0u);
+	}
+	if (CONFIG_DMR && board.radio != NULL && board.radio->tx_drive != NULL) {
+		dl_text(t, "pa_keyrun.last=%u/%u\n", (unsigned)pa_keyrun_last_n, (unsigned)pa_keyrun_last_of);
+	}
+	dl_text(t, "scan=%s\nscan_phase=%s\nscan_skipped=%u\n", word(v->scan, kinds, 4), word(v->scan_phase, phases, 5),
+		v->scan_skipped);
+	dl_text(t, "scan_probes=%u\nscan_synced=%u\n", v->scan_probes, v->scan_synced);
+	// Dual watch: the two channels ("vfo", or zone index:position), the selected one and the one the receiver is on
+	// now; "-" while it is off
+	radio_dual_ref_t dual[2];
+	uint8_t sel, at;
+	bool on = radio_get_dual(dual, &sel, &at);
+	for (uint8_t i = 0; i < 2; i++) {
+		if (!on) {
+			dl_text(t, "dual.%c=-\n", 'a' + i);
+		} else if (dual[i].vfo) {
+			dl_text(t, dual[i].pos ? "dual.%c=vfo2\n" : "dual.%c=vfo\n", 'a' + i);
+		} else {
+			dl_text(t, "dual.%c=%u:%u\n", 'a' + i, dual[i].zone, dual[i].pos);
+		}
+	}
+	// receivers: what the radio has; both: the second receiver has the channel not selected now (dual.at is then the
+	// main receiver's, always the selected one)
+	dl_text(t, "dual.built=%u\ndual.sel=%c\ndual.at=%c\ndual.receivers=%u\ndual.both=%u\n", CONFIG_DUAL_WATCH,
+		on ? 'a' + sel : '-', on ? 'a' + at : '-', board.rx2 != NULL ? 2u : 1u, on && v->rx2);
+	// busy: the channels a look in the wait after a call found a signal on (bit 0 A, bit 1 B)
+	dl_text(t, "dual.busy=%u\ndual.stops=%u\n", v->dual_busy, v->dual_stops);
+	dl_text(t, "tot_warning=%u\ntone_burst=%u\nroger=%u\nvox_keyed=%u\nrx_sleeping=%u\n", v->tot_warning,
+		v->tone_burst, v->roger, v->vox_keyed, v->rx_sleeping);
+#if CONFIG_DTMF
+	// DTMF (radio-features.md 3.7): whether a key would send now, then, only when they are not at rest, the digit
+	// sounding, the count since start-up and this transmission's digits (this view is close to the reply's size cap)
+	dl_text(t, "dtmf_ready=%u\n", v->dtmf_ready);
+	if (v->dtmf != 0) {
+		dl_text(t, "dtmf=%c\n", v->dtmf);
+	}
+	if (v->dtmf_sent != 0) {
+		dl_text(t, "dtmf_sent=%u\n", v->dtmf_sent);
+	}
+	if (v->dtmf_digits[0] != 0) {
+		dl_text(t, "dtmf_digits=%s\n", v->dtmf_digits);
+	}
+#endif
+	bool mic = board.power != NULL && board.power->mic_level != NULL;
+	// The hook itself, not the VOX poll's last reading, so the level reads with VOX off (nothing keys). Only where VOX
+	// could listen (FM, not a hotspot): a meter that starts on demand (the HR_C7000's mic PCM) then runs in the state
+	// VOX would run it in, and reads 0 on its first call
+	bool listen = mic && v->ch.mode == RADIO_MODE_FM && !v->hotspot;
+	dl_text(t, "vox_on=%u\nvox.mic=%u\nvox.level=%u\n", v->vox_on, mic, listen ? board.power->mic_level() : 0u);
+	// whether battery save can switch the receiver off on this radio (a radio driver without rx_sleep never sleeps)
+	dl_text(t, "rx_save.hw=%u\n", board.radio != NULL && board.radio->rx_sleep != NULL);
+	// a radio that measures its DC input has supply_mv in place of the battery's percentage and
+	// reading (the section is near a reply's size)
+	if (board_volts() == BOARD_VOLTS_SUPPLY)
+		dl_text(t, "battery=none\nsupply_mv=%u\npower_off=%u\n", v->supply_mv, v->power_off);
+	else
+		dl_text(t, "battery=%s\nbattery_pct=%u\nbattery_mv=%u\npower_off=%u\n",
+			board_has_battery() ? word(v->battery, batt, 3) : "none", v->battery_pct, v->battery_mv, v->power_off);
+	static const char *const vsrc[] = { "none", "knob", "soft", "override", "hold" };
+	dl_text(t, "volume.soft=%u\nvolume.sent=%d\nvolume.src=%s\nvolume.max=%u\nvolume.step=%u\nvolume.override=%d\n",
+		radio_volume_soft(), v->volume, word(v->volume_src, vsrc, 5), RADIO_VOLUME_MAX, v->volume_step, v->volume_override);
+#if CONFIG_BEEP
+	beep_stats_t b;
+	beep_get_stats(&b);
+	dl_text(t, "beep.built=1\nbeep.played=%u\nbeep.no_stream=%u\nbeep.blocks=%u\nbeep.stalls=%u\nbeep.busy=%u\n",
+		(unsigned)b.played, (unsigned)b.no_stream, (unsigned)b.blocks, (unsigned)b.stalls, beep_busy());
+#else
+	dl_text(t, "beep.built=0\n");
+#endif
+#if CONFIG_VIBRATE
+	dl_text(t, "vibe.built=1\nvibe.motor=%u\nvibe.played=%u\nvibe.busy=%u\n",
+		board.power != NULL && board.power->vibrate != NULL, (unsigned)vibe_played(), vibe_busy());
+#else
+	dl_text(t, "vibe.built=0\n");
+#endif
+	radio_get_settings(&s);
+	dl_text(t, "set.tot_s=%u\nset.tot_warn_s=%u\nset.bcl=%s\nset.roger_beep=%u\nset.tx_inhibit=%u\n", s.tot_s,
+		s.tot_warn_s, word(s.bcl, bcls, 3), s.roger_beep, s.tx_inhibit);
+	dl_text(t, "set.scan_resume=%s\nset.scan_hold_s=%u\nset.scan_delay_ms=%u\nset.scan_dwell_ms=%u\n",
+		word(s.scan_resume, resumes, 3), s.scan_hold_s, s.scan_delay_ms, s.scan_dwell_ms);
+	dl_text(t, "set.scan_priority=%u\nset.beep_level=%u\nset.key_beep=%u\nset.dual_delay_ms=%u\n", s.scan_priority,
+		s.beep_level, s.key_beep, s.dual_delay_ms);
+	dl_text(t, "set.vox=%s\nset.vox_level=%u\nset.vox_tail_ms=%u\n", word(s.vox, voxes, 3), s.vox_level,
+		s.vox_tail_ms);
+	dl_text(t, "set.rx_save=%u\nset.rx_save_idle_s=%u\nset.battery_off_s=%u\n", s.rx_save, s.rx_save_idle_s,
+		s.battery_off_s);
+	// The step in effect (the UI's setting or the SETTING op's) and whether the board's audio path takes it
+	dl_text(t, "set.mic_gain=%u\nset.mic_gain_board=%u\n", radio_mic_gain(), mic_gain_on_board());
+	if (s.reply_s <= 30) {
+		dl_text(t, "set.reply_s=%u\n", s.reply_s);
+	} else {
+		dl_text(t, "set.reply_s=codeplug\n");
+	}
+}
+
+void debuglink_view_keys(dl_text_t *t)
+{
+#if CONFIG_KEY_ASSIGN
+	if (board.side_key_count != 0) {
+		uint16_t slots[CODEPLUG_QUICK_KEYS];
+		(void)codeplug_quick_keys(slots);
+		// The saved assignment lets HIL restore the key through Settings after exercising its physical bit.
+		dl_text(t, "key.first.bit=%u\nkey.first.press=%u\n", board.side_keys[0], keyassign_get(slots, 0, false));
+	}
+#else
+	(void)t;
+#endif
+}
+
+// One setting by id (DL radio op SETTING; docs/spec/debuglink.md 3.8)
+static bool set_one(radio_settings_t *s, uint8_t id, uint16_t v)
+{
+	switch (id) {
+	case 1: s->tot_s = v; break;
+	case 2: s->tot_warn_s = (uint8_t)v; break;
+	case 3: if (v > RADIO_BCL_WRONG_TONE) return false; s->bcl = (uint8_t)v; break;
+	case 4: s->roger_beep = v != 0; break;
+	case 5: s->tx_inhibit = v != 0; break;
+	case 6: if (v > 2) return false; s->scan_resume = (uint8_t)v; break;
+	case 7: s->scan_hold_s = (uint8_t)v; break;
+	case 8: s->scan_delay_ms = v; break;
+	case 9: s->scan_dwell_ms = v; break;
+	case 10: s->scan_priority = v != 0; break;
+	case 11: if (v > 100) return false; s->beep_level = (uint8_t)v; break;
+	case 12: s->key_beep = v != 0; break;
+	case 13: if (v > RADIO_VOX_ALL) return false; s->vox = (uint8_t)v; break;
+	case 14: if (v > 10) return false; s->vox_level = (uint8_t)v; break;
+	case 15: s->vox_tail_ms = v; break;
+	case 16: if (v > 3) return false; s->rx_save = (uint8_t)v; break;
+	case 17: s->rx_save_idle_s = v; break;
+	case 18: s->battery_off_s = v; break;
+	case 19: s->scan_beep = v != 0; break;
+	case 20: if (v > 30 && v != RADIO_REPLY_CODEPLUG) return false; s->reply_s = (uint8_t)v; break;
+	case 21: if ((int16_t)v < -125 || (int16_t)v > -60) return false; s->roam_rssi_dbm = (int8_t)(int16_t)v; break;
+	case 22: if (v < 1 || v > 30) return false; s->roam_hyst_db = (uint8_t)v; break;
+	case 23: if (v > 1) return false; s->roam_probe = (uint8_t)v; break;
+	case 24: if (v != 0 && (v < 30 || v > 3600)) return false; s->roam_check_s = v; break;
+	case 25: if (v != 0 && (v < 10 || v > 600)) return false; s->roam_beacon_s = v; break;
+	case 26: if (v < 1 || v > 10) return false; s->roam_beacon_len_s = (uint8_t)v; break;
+	case 27: if (v > 2) return false; s->roam_survey = (uint8_t)v; break;
+	case 28: s->rpt_beacon = v != 0; break;
+	case 30: if (v > RADIO_DUAL_DELAY_MAX_MS) return false; s->dual_delay_ms = v; break;
+	case 33: if (v >= RADIO_CWID_CODES || !CONFIG_SFR_CWID) return false; s->sfr_cwid = (uint8_t)v; break;
+	case 34: if (v > 2 || (v == 2 && !CONFIG_SFR_DUALPATH_RX)) return false; s->sfr_rx = (uint8_t)v; break;
+	default: return false;
+	}
+	return true;
+}
+
+// SCAN's own command after the radio_scan_cmd_t ones: dual watch selects A (0) or B (1), the pair kept. The UI follows
+// (view.dual_sel), and the channel, zone and VFO requests then act on that one
+#define DL_SCAN_DUAL_SELECT	7u
+
+uint8_t debuglink_radio_feature_op(uint8_t op, const uint8_t *a, uint16_t len)
+{
+	switch (op) {
+	case DL_OP_SCAN:
+		if (len >= 1 && a[0] == DL_SCAN_DUAL_SELECT) {
+			radio_dual_ref_t ref[2];
+			uint8_t sel, at;
+			if (len < 2 || a[1] > 1) {
+				return DL_ST_BAD_ARG;
+			}
+			if (!CONFIG_DUAL_WATCH || !radio_get_dual(ref, &sel, &at)) {
+				return DL_ST_UNAVAILABLE;	// not built, or the watch is off
+			}
+			radio_req_dual(ref, a[1]);
+			return DL_ST_OK;
+		}
+		if (len < 1 || a[0] > RSCAN_TOGGLE) {
+			return DL_ST_BAD_ARG;
+		}
+		if (!CONFIG_SCAN) {
+			return DL_ST_UNAVAILABLE;
+		}
+		if (a[0] == RSCAN_DUAL) {
+			if (len < 3) {
+				return DL_ST_BAD_ARG;
+			}
+			radio_req_scan_dual((uint16_t)(a[1] | (a[2] << 8)));
+		} else {
+			radio_req_scan(a[0]);
+		}
+		return DL_ST_OK;
+	case DL_OP_SCAN_VFO:
+		if (len < 8) {
+			return DL_ST_BAD_ARG;
+		}
+		if (!CONFIG_SCAN) {
+			return DL_ST_UNAVAILABLE;
+		}
+		radio_req_scan_vfo((uint32_t)a[0] | ((uint32_t)a[1] << 8) | ((uint32_t)a[2] << 16) | ((uint32_t)a[3] << 24),
+				   (uint32_t)a[4] | ((uint32_t)a[5] << 8) | ((uint32_t)a[6] << 16) | ((uint32_t)a[7] << 24));
+		return DL_ST_OK;
+	case DL_OP_BEEP:
+		if (len < 1 || a[0] == BEEP_NONE || a[0] >= BEEP_COUNT) {
+			return DL_ST_BAD_ARG;
+		}
+		if (!CONFIG_BEEP) {
+			return DL_ST_UNAVAILABLE;
+		}
+		if (len >= 2 && a[1] != 0) {	// the delay in seconds: the cable can come out of a radio it mutes
+			radio_req_beep_after(a[0], (uint32_t)a[1] * 1000u);
+		} else {
+			radio_req_beep(a[0]);
+		}
+		return DL_ST_OK;
+	case DL_OP_VIBRATE:
+		if (len < 1 || a[0] == VIBE_NONE || a[0] >= VIBE_COUNT) {
+			return DL_ST_BAD_ARG;
+		}
+		if (!CONFIG_VIBRATE) {
+			return DL_ST_UNAVAILABLE;
+		}
+		radio_req_vibrate(a[0]);	// played whatever the UI's Vibrate setting; nothing without a motor
+		return DL_ST_OK;
+	case DL_OP_VOLUME:
+		// step 0..RADIO_VOLUME_MAX; RADIO_VOLUME_KNOB (0xFF) gives the knob back. A radio without a knob keeps the
+		// step like a UI change (stored); one with a knob holds it in RAM over the knob. No hook: unavailable
+		if (len < 1 || (a[0] > RADIO_VOLUME_MAX && a[0] != RADIO_VOLUME_KNOB)) {
+			return DL_ST_BAD_ARG;
+		}
+		if (!radio_volume_settable()) {
+			return DL_ST_UNAVAILABLE;
+		}
+		if (radio_volume_soft()) {
+			settings_t *st = settings_begin();
+			st->volume = a[0] == RADIO_VOLUME_KNOB ? 0 : radio_volume_stored(a[0]);
+			settings_end(hal_millis());
+			radio_req_volume(a[0] == RADIO_VOLUME_KNOB ? RADIO_VOLUME_DEFAULT : a[0]);
+		} else {
+			radio_req_volume_override(a[0] == RADIO_VOLUME_KNOB ? -1 : (int8_t)a[0]);
+		}
+		return DL_ST_OK;
+	case DL_OP_VOICE_TEST:
+		// u8: 1 the DMR encoder gets the voice layer's test signal in place of the mic, 0 the mic again (RAM only)
+		if (len < 1 || a[0] > 1) {
+			return DL_ST_BAD_ARG;
+		}
+#if CONFIG_DMR
+		ambeVoiceSetTestSignal(a[0] != 0);
+		return DL_ST_OK;
+#else
+		return DL_ST_UNAVAILABLE;
+#endif
+	case DL_OP_VOICE_CAPTURE:
+		// u8: capture the next n voice frames received (0 stops), the voice_cap view shows them
+		if (len < 1) {
+			return DL_ST_BAD_ARG;
+		}
+#if CONFIG_VOICE_CAPTURE
+		ambeVoiceCaptureArm(a[0]);
+		return DL_ST_OK;
+#else
+		return DL_ST_UNAVAILABLE;
+#endif
+	case DL_OP_DMR_FIELDS:
+		// mode (0xFF = keep, else radio_mode_t), color code (0xFF = keep), timeslot (0 = keep): on a channel they are
+		// temporary changes, in the VFO the VFO's own settings. The radio core refuses what it can't do
+		if (len < 3 || (a[0] != 0xFF && a[0] > RADIO_MODE_YSF) || (a[1] != 0xFF && a[1] > 15) || a[2] > 2) {
+			return DL_ST_BAD_ARG;
+		}
+#if CONFIG_DMR || CONFIG_P25
+		if ((a[0] == RADIO_MODE_DMR && !CONFIG_DMR) || (a[0] == RADIO_MODE_P25 && !CONFIG_P25) ||
+		    (a[0] == RADIO_MODE_NXDN && !CONFIG_NXDN) || (a[0] == RADIO_MODE_YSF && !CONFIG_YSF) ||
+		    ((a[1] != 0xFF || a[2] != 0) && !CONFIG_DMR)) {
+			return DL_ST_UNAVAILABLE;
+		}
+		if (a[0] != 0xFF) {
+			radio_req_mode(a[0]);
+		}
+#if CONFIG_DMR
+		if (a[1] != 0xFF) {
+			radio_req_dmr_color_code(a[1]);
+		}
+		if (a[2] != 0) {
+			radio_req_dmr_timeslot(a[2]);
+		}
+#endif
+		return DL_ST_OK;
+#else
+		return DL_ST_UNAVAILABLE;
+#endif
+	case DL_OP_P25: {
+		// The P25 settings (radio_p25_settings_t, RAM only; docs/spec/debuglink.md 3.8): u16 rx_nac, u16 tx_nac,
+		// u16 rx_tgid, u8 talkaround (0 auto, 1 on, 2 off), u8 flags (bit 0: PTT calls a unit), u32 tx_dst,
+		// u32 unit_id (0: the radio's DMR ID), little-endian. The engine takes them when not transmitting
+		if (len < 16 || a[6] > RADIO_P25_TA_OFF || (a[7] & 0xFEu) != 0) {
+			return DL_ST_BAD_ARG;
+		}
+#if CONFIG_P25
+		radio_p25_settings_t p;
+		p.rx_nac = (uint16_t)(a[0] | a[1] << 8);
+		p.tx_nac = (uint16_t)(a[2] | a[3] << 8);
+		p.rx_tgid = (uint16_t)(a[4] | a[5] << 8);
+		p.talkaround = a[6];
+		p.unit_call = (a[7] & 1u) != 0;
+		p.tx_dst = (uint32_t)a[8] | (uint32_t)a[9] << 8 | (uint32_t)a[10] << 16 | (uint32_t)a[11] << 24;
+		p.unit_id = (uint32_t)a[12] | (uint32_t)a[13] << 8 | (uint32_t)a[14] << 16 | (uint32_t)a[15] << 24;
+		if (p.rx_nac > 0xFFFu || p.tx_nac > 0xFFFu || p.unit_id > 0xFFFFFFu ||
+		    p.tx_dst > (p.unit_call ? 0xFFFFFFu : 0xFFFFu)) {
+			return DL_ST_BAD_ARG;
+		}
+		radio_req_p25_settings(&p);
+		return DL_ST_OK;
+#else
+		return DL_ST_UNAVAILABLE;
+#endif
+	}
+	case DL_OP_NXDN: {
+		// The NXDN settings (radio_nxdn_settings_t, RAM only; docs/spec/debuglink.md 3.8): u8 flags (bit 0: 9600
+		// bit/s, else 4800; bit 1: PTT calls a unit; bit 2: emergency), u8 rx_ran (0 any), u8 tx_ran, u16 rx_gid (0: the
+		// RAN squelch), u16 unit_id (1..65519), u16 tx_dst, little-endian. The engine takes them when not transmitting;
+		// a new rate starts it over
+		if (len < 9 || (a[0] & 0xF8u) != 0 || a[1] > 63 || a[2] > 63) {
+			return DL_ST_BAD_ARG;
+		}
+#if CONFIG_NXDN
+		radio_nxdn_settings_t n;
+		n.rate9600 = (a[0] & 1u) != 0;
+		n.unit_call = (a[0] & 2u) != 0;
+		n.emergency = (a[0] & 4u) != 0;
+		n.rx_ran = a[1];
+		n.tx_ran = a[2];
+		n.rx_gid = (uint16_t)(a[3] | a[4] << 8);
+		n.unit_id = (uint16_t)(a[5] | a[6] << 8);
+		n.tx_dst = (uint16_t)(a[7] | a[8] << 8);
+		if (n.unit_id == 0 || n.unit_id > RADIO_NXDN_UNIT_MAX) {
+			return DL_ST_BAD_ARG;
+		}
+		radio_req_nxdn_settings(&n);
+		return DL_ST_OK;
+#else
+		return DL_ST_UNAVAILABLE;
+#endif
+	}
+	case DL_OP_YSF: {
+		// The YSF settings (radio_ysf_settings_t, RAM only; docs/spec/debuglink.md 3.8): u8 flags (bit 0: Narrow
+		// deviation, else Wide; bits 1-2: the data type), u8 rx_dgid (0 any), u8 tx_dgid, then the call signs as 10
+		// ASCII characters each (space padded): source, destination, downlink, uplink. The engine takes them when
+		// not transmitting; a new data type or deviation starts it over
+		if (len < 43 || (a[0] & 0xF8u) != 0 || a[1] > RADIO_YSF_DGID_MAX || a[2] > RADIO_YSF_DGID_MAX) {
+			return DL_ST_BAD_ARG;
+		}
+#if CONFIG_YSF
+		radio_ysf_settings_t y;
+		y.dt = (uint8_t)((a[0] >> 1) & YSF_CP_DT_MASK);
+		y.narrow = (a[0] & 1u) != 0;
+		y.rx_dgid = a[1];
+		y.tx_dgid = a[2];
+		ysf_callsign_unpack(&a[3], y.src);
+		ysf_callsign_unpack(&a[13], y.dest);
+		ysf_callsign_unpack(&a[23], y.down);
+		ysf_callsign_unpack(&a[33], y.up);
+		if (y.dest[0] == '\0')
+			strcpy(y.dest, YSF_CP_DEST_ALL);
+		radio_req_ysf_settings(&y);
+		return DL_ST_OK;
+#else
+		return DL_ST_UNAVAILABLE;
+#endif
+	}
+	case DL_OP_VFO_SFR:
+		// u8: the VFO's SFR role as a channel's SFR byte A (sfr.h; role bits 0 = none). The radio core refuses it
+		// outside the VFO; dmr.sfr_role shows what it took
+		if (len < 1 || (a[0] & 0x07u) >= SFR_ROLE_NUM_STORED) {
+			return DL_ST_BAD_ARG;
+		}
+#if CONFIG_SFR
+		radio_req_vfo_sfr(a[0]);
+		return DL_ST_OK;
+#else
+		return DL_ST_UNAVAILABLE;
+#endif
+	case DL_OP_VFO_COPY: {
+		// Copy to VFO, as the quick menu's tile does: refused with a status when the VFO can't hold the channel
+		// (the check is the radio core's), nothing sent then
+		switch (radio_req_vfo_copy_checked()) {
+		case VFO_COPY_OK:
+			return DL_ST_OK;
+		case VFO_COPY_NO_MODE:
+		case VFO_COPY_OUT_OF_BAND:
+			return DL_ST_REFUSED;
+		default:
+			return DL_ST_UNAVAILABLE;	// no VFO in this build, or already in it
+		}
+	}
+	case DL_OP_TONE_BURST:
+		if (len < 1) {
+			return DL_ST_BAD_ARG;
+		}
+		if (!CONFIG_FM_TX_TONES) {
+			return DL_ST_UNAVAILABLE;
+		}
+		// on u8, then max_ms u16 (optional; 0 or missing: INPUT_INJECT_MAX_MS, the cap as for PTT): the burst ends by
+		// itself when its "off" doesn't come
+		{
+			uint32_t max_ms = len >= 3 ? (uint32_t)(a[1] | (a[2] << 8)) : 0;
+			radio_req_tone_burst(a[0] != 0, max_ms == 0 || max_ms > INPUT_INJECT_MAX_MS ? INPUT_INJECT_MAX_MS : max_ms);
+		}
+		return DL_ST_OK;
+	case DL_OP_TX_LIMIT: {
+		// flags u8 (bit 0: block every transmission), n u8, then n frequencies u32 (Hz): the test TX limit, RAM only
+		// (tx_limit.h). No block and no list: off
+		uint32_t hz[TX_LIMIT_MAX];
+		if (len < 2 || a[1] > TX_LIMIT_MAX || len != 2u + 4u * a[1] || (a[0] & ~1u) != 0) {
+			return DL_ST_BAD_ARG;
+		}
+		for (uint8_t i = 0; i < a[1]; i++) {
+			const uint8_t *p = a + 2 + 4 * i;
+			hz[i] = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+		}
+		return tx_limit_set((a[0] & 1u) != 0, hz, a[1]) ? DL_ST_OK : DL_ST_BAD_ARG;
+	}
+	case DL_OP_TX_DRIVE:
+		// drive u16: the PA drive of the next transmission in the board's units, 0 = its power level's again
+		// (hal_radio_t.tx_drive; power calibration). The radio's transmit rules still apply
+		if (len < 2) {
+			return DL_ST_BAD_ARG;
+		}
+		if (board.radio == NULL || board.radio->tx_drive == NULL) {
+			return DL_ST_UNAVAILABLE;
+		}
+		return board.radio->tx_drive((uint16_t)(a[0] | (a[1] << 8))) ? DL_ST_OK : DL_ST_BAD_ARG;
+	case DL_OP_PA_KEYUP: {
+		// dead_pm, knee_us, slope_us, window_us, settle_us, pa_us and (optional, else 0) ease_pm, each u16: the DMR
+		// PA key-up constants (radio/pa_keyup.h), RAM only, from the next key-up; no argument = the board's again
+		if (len != 0 && len != 12 && len != 14) {
+			return DL_ST_BAD_ARG;
+		}
+#if !CONFIG_DMR
+		return DL_ST_UNAVAILABLE;
+#else
+		if (pa_keyup_cfg() == NULL) {
+			return DL_ST_UNAVAILABLE;
+		}
+		if (len == 0) {
+			return pa_keyup_set(NULL) ? DL_ST_OK : DL_ST_BAD_ARG;
+		}
+		pa_keyup_cfg_t c = {
+			.dead_pm = (uint16_t)(a[0] | (a[1] << 8)), .knee_us = (uint16_t)(a[2] | (a[3] << 8)),
+			.slope_us = (uint16_t)(a[4] | (a[5] << 8)), .window_us = (uint16_t)(a[6] | (a[7] << 8)),
+			.settle_us = (uint16_t)(a[8] | (a[9] << 8)), .pa_us = (uint16_t)(a[10] | (a[11] << 8)),
+			.ease_pm = len == 14 ? (uint16_t)(a[12] | (a[13] << 8)) : (uint16_t)0u,
+		};
+		return pa_keyup_set(&c) ? DL_ST_OK : DL_ST_BAD_ARG;
+#endif
+	}
+	case DL_OP_PA_SWEEP: {
+		// start u16, step i16, count u8, on_ms u8, off_ms u8, ceiling u8 (% of the top level's drive), mark_ms u8: the PA
+		// drive sweep on the FM carrier the radio transmits now (radio/pa_sweep.h). Returns when it is done (at most
+		// PA_SWEEP_MS_MAX); the view's pa_sweep.last says how many points ran and the top level's drive
+		if (len != 9) {
+			return DL_ST_BAD_ARG;
+		}
+		const hal_radio_t *r = board.radio;
+		if (r == NULL || r->tx_drive_top == NULL || r->tx_drive_now == NULL) {
+			return DL_ST_UNAVAILABLE;
+		}
+		uint16_t top = r->tx_drive_top();
+		if (top == 0u) {
+			return DL_ST_REFUSED;	// not transmitting FM
+		}
+		pa_sweep_req_t q = {
+			.start = (uint16_t)(a[0] | (a[1] << 8)), .step = (int16_t)(uint16_t)(a[2] | (a[3] << 8)), .count = a[4],
+			.on_ms = a[5], .off_ms = a[6], .ceiling_pct = a[7], .mark_ms = a[8],
+		};
+		const pa_sweep_io_t io = { .drive = r->tx_drive_now, .mark = r->tx_mark, .delay_ms = hal_delay_ms };
+		uint16_t max = UINT16_MAX;	// the board's drive limit, as the key-up's (pa_keyup_init)
+#if CONFIG_DMR
+		uint16_t ahead, lim;
+		pa_keyup_limits(&ahead, &lim);
+		if (lim != 0u) {
+			max = lim;
+		}
+#endif
+		pa_sweep_last_n = pa_sweep_run(&q, top, max, &io);
+		pa_sweep_last_top = top;
+		return DL_ST_OK;
+	}
+	case DL_OP_PA_KEYRUN: {
+		// key_ms u16, gap_ms u16, flags u8, n u8, [the key-up constants as op 37's 14 bytes], n drives u16: the radio
+		// keys n times at those drives on its channel (radio/pa_keyrun.h), the host link held until it is done. The
+		// view's pa_keyrun.last says how many ran
+#if !CONFIG_DMR
+		return DL_ST_UNAVAILABLE;
+#else
+		pa_keyrun_req_t q;
+		if (!pa_keyrun_parse(a, len, &q)) {
+			return DL_ST_BAD_ARG;
+		}
+		if (board.radio == NULL || board.radio->tx_drive == NULL) {
+			return DL_ST_UNAVAILABLE;
+		}
+		const pa_keyrun_io_t io = { .drive = board.radio->tx_drive, .keyup = keyrun_keyup, .ptt = keyrun_ptt,
+					    .keyed = keyrun_keyed, .delay_ms = hal_delay_ms };
+		pa_keyrun_last_of = q.n;
+		pa_keyrun_last_n = 0u;
+		pa_keyrun_last_n = pa_keyrun_run(&q, &io);
+		keyrun_reattach = q.reattach;	// after the reply (debuglink_keyrun_service)
+		keyrun_restart = q.restart;
+		return pa_keyrun_last_n == q.n ? DL_ST_OK : DL_ST_REFUSED;
+#endif
+	}
+	case DL_OP_DTMF:
+		// digit u8 (ASCII), down u8: as a DTMF key's edge, so the same rules and timing apply. Refused unless a key
+		// would send now (dtmf_ready); an up is always taken
+		if (len < 2 || (a[1] != 0 && !dtmf_valid((char)a[0]))) {
+			return DL_ST_BAD_ARG;
+		}
+		if (!CONFIG_DTMF) {
+			return DL_ST_UNAVAILABLE;
+		}
+		if (a[1] != 0 && !radio_dtmf_ready()) {
+			return DL_ST_REFUSED;
+		}
+		radio_req_dtmf((char)a[0], a[1] != 0);
+		return DL_ST_OK;
+	case DL_OP_ROAM:
+		if (len < 1 || a[0] > RROAM_LOCK_TOGGLE) {
+			return DL_ST_BAD_ARG;
+		}
+		if (!CONFIG_DMR_ROAMING) {
+			return DL_ST_UNAVAILABLE;
+		}
+		radio_req_roam(a[0]);
+		return DL_ST_OK;
+	case DL_OP_SETTING: {
+		if (len < 3) {
+			return DL_ST_BAD_ARG;
+		}
+		uint16_t v = (uint16_t)(a[1] | (a[2] << 8));
+		if (a[0] == DL_SETTING_MIC_GAIN) {	// not a radio_settings_t field: the UI stores it (radio/mic_gain.h)
+			if (v > MIC_GAIN_STEPS) {
+				return DL_ST_BAD_ARG;
+			}
+			if (!mic_gain_available()) {
+				return DL_ST_UNAVAILABLE;
+			}
+			radio_set_mic_gain((uint8_t)v);
+			return DL_ST_OK;
+		}
+		if (a[0] == DL_SETTING_REF_TRIM) {	// as the mic gain: the UI stores it, this sets it in RAM only
+			int16_t ppb = (int16_t)v;
+			if (ppb < -REF_TRIM_MAX_PPB || ppb > REF_TRIM_MAX_PPB) {
+				return DL_ST_BAD_ARG;
+			}
+			if (!ref_trim_available()) {
+				return DL_ST_UNAVAILABLE;
+			}
+			if (radio_set_ref_trim(ppb)) {
+				radio_req_retune();
+			}
+			return DL_ST_OK;
+		}
+#if CONFIG_DMR
+		// The encode options for the next frames (dmr-voice.md 6), not stored: a restart or a change of Mic noise
+		// reduction / Mic AGC brings back the settings'. Lets a test send combinations the menu can't (0x800)
+		if (a[0] == DL_SETTING_ENC_OPTIONS) {
+			if (v > (VOCODER_OPT_DEFAULT | VOCODER_OPT_AGC)) {
+				return DL_ST_BAD_ARG;
+			}
+			if (ambeVoiceEncodeOptionsSupported() == 0) {
+				return DL_ST_UNAVAILABLE;
+			}
+			ambeVoiceSetEncodeOptions(v);
+			return DL_ST_OK;
+		}
+#endif
+		// Zone share offers (zone-share.md 5.1), not stored: a restart brings back the setting's. Lets a test take
+		// offers without walking the Settings menu
+		if (a[0] == DL_SETTING_ZS_OFFERS) {
+#if CONFIG_ZONE_SHARE
+			if (v > ZS_OFFERS_ASK) {
+				return DL_ST_BAD_ARG;
+			}
+			zone_share_set_offers((uint8_t)v);
+			return DL_ST_OK;
+#else
+			return DL_ST_UNAVAILABLE;
+#endif
+		}
+		if (a[0] == DL_SETTING_TONES_OFF) {
+			// Keyed settings (codeplug-settings.md 5.2), stored as the menu's are: a key the codeplug holds would put
+			// the radio's own copy back
+			if (v & ~RADIO_TONES_MASK) {
+				return DL_ST_BAD_ARG;
+			}
+			radio_settings_t s;
+			radio_tones_t was, now;
+			radio_get_settings(&s);
+			radio_tones_unpack(s.tones_off, &was);
+			radio_tones_unpack((uint8_t)v, &now);
+			if (!codeplug_keys_store(radio_tone_rows, RADIO_TONE_ROWS_N, &was, &now)) {
+				return DL_ST_BUSY;
+			}
+			radio_get_settings(&s);		// again after the flash write: another change meanwhile stays
+			s.tones_off = (uint8_t)v;
+			radio_set_settings(&s);
+			return DL_ST_OK;
+		}
+		if (a[0] == DL_SETTING_GPS) {
+			// Stored and applied as the menu does (ui_svc_apply): the module's power and the position source
+			if (v > 1) {
+				return DL_ST_BAD_ARG;
+			}
+			if (!CONFIG_GPS || !board_has_gps()) {
+				return DL_ST_UNAVAILABLE;
+			}
+			settings_begin()->gps = (uint8_t)v;
+			settings_end(hal_millis());
+			board_gps_enable(v != 0);
+#if CONFIG_GPS
+			position_gps_enable(v != 0);
+#endif
+			return DL_ST_OK;
+		}
+		radio_settings_t s;
+		radio_get_settings(&s);
+		if (!set_one(&s, a[0], v)) {
+			return DL_ST_BAD_ARG;
+		}
+		radio_set_settings(&s);
+		return DL_ST_OK;
+	}
+	default:
+		return DL_ST_BAD_ARG;
+	}
+}

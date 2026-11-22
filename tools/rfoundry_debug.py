@@ -1,0 +1,3189 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 The RadioFoundry Authors
+"""rfoundry_debug: talk to a radio's USB debug link (docs/spec/debuglink.md). Command line tool and Python module
+(tests/hil uses the DebugLink class).
+
+    rfoundry_debug.py [--port DEV] ping
+    rfoundry_debug.py version
+    rfoundry_debug.py diag [--watch N] [--raw]       radio summary + voice path + board diagnostics lines, with rates
+    rfoundry_debug.py view [--section NAME] [--json] the radio state as key=value (all sections)
+    rfoundry_debug.py reset                          zero the diagnostics counters
+    rfoundry_debug.py screenshot -o FILE.png [--scale N] [--crop] [--tries N]
+    rfoundry_debug.py key NAME [--long | --hold MS | --repeat N | --down | --up | --steps N]
+    rfoundry_debug.py key --mask 0xBITS --hold MS    physical key bits
+    rfoundry_debug.py wake                           backlight on without a key event
+    rfoundry_debug.py ptt --seconds S                key PTT for S seconds (at most 10; the firmware also times out)
+    rfoundry_debug.py radio OP [ARG...]              channel +1, pos 3, zone 0, vfo on, freq MHZ, power lowest|LEVEL|+1, copy-vfo, ...
+    rfoundry_debug.py radio mode fm|dmr|p25|nxdn|ysf  the channel's mode for now (the VFO's own in the VFO)
+    rfoundry_debug.py radio p25 [nac=N] [tg=N|unit=N] [rx_tgid=N] [talkaround=auto|on|off] [unit_id=N]
+                                                the P25 settings (CONFIG_P25; RAM only, view section p25)
+    rfoundry_debug.py radio nxdn [rate=9600|4800] [ran=N] [rx_ran=N] [tx_ran=N] [rx_gid=N] [tg=N|unit=N]
+                                 [unit_id=N] [emergency=0|1]
+                                                the NXDN settings (CONFIG_NXDN; RAM only, view section nxdn)
+    rfoundry_debug.py radio ysf [dt=vd1|data|dn|vw] [dev=wide|narrow] [dgid=N] [rx_dgid=N] [tx_dgid=N]
+                                [src=CALL] [dest=CALL] [down=CALL] [up=CALL]
+                                                the YSF settings (CONFIG_YSF; RAM only, view section ysf)
+    rfoundry_debug.py volume [N|knob]                print the speaker volume; N (0 mutes, 0..16) sets it, knob gives the knob back
+    rfoundry_debug.py log [--follow]                 the firmware's dlog() ring
+    rfoundry_debug.py chip                           chip ID, flash size, UID, option bytes (RDP, write protection)
+    rfoundry_debug.py dump --addr A --len N -o F     read flash or another readable window to a file (debuglink.md 3.10)
+    rfoundry_debug.py peek ADDR[:LEN]                hex dump of LEN bytes (default 4) at ADDR, in words where aligned
+                                                outside any git tree
+    rfoundry_debug.py reboot [--rom-dfu]             reset; --rom-dfu: into ST's ROM USB DFU (RDP level 0 only)
+    rfoundry_debug.py crash [show|clear|test trap|test assert|test hang|test stall]
+                                                the crash log (CONFIG_CRASH_LOG): the record kept from before this
+                                                start, forget it, or crash on purpose (the radio restarts)
+    rfoundry_debug.py watchdog [show|clear-gap]      the hardware watchdog (CONFIG_WATCHDOG): timeout, feeds, longest idle gap
+    rfoundry_debug.py watchdog test starve|spin|irq-off
+                                                stop the feeds (docs/spec/watchdog.md 5): the radio resets. starve polls
+                                                until the link goes quiet and prints how long it lasted
+    rfoundry_debug.py watchdog load H L [RST]        HR_C7000: re-arm with raw OT_LOAD_H / OT_LOAD_L (RST_LOAD), then starve
+    rfoundry_debug.py storage info                   the settings / journal region: ours or foreign, its addresses
+    rfoundry_debug.py storage dump --out DIR         the region and the calibration copy (SPI flash) to files outside git
+    rfoundry_debug.py storage claim --out DIR        dump first, then let the firmware erase a foreign region and use it
+    rfoundry_debug.py aprobe OP [ARG...]             audio probe (CONFIG_AUDIO_PROBE builds; docs/spec/hardware-dm1701.md 21.3):
+                                                status | reg PAGE REG | wreg PAGE REG VAL | start [HZ [AMP [spk]]] |
+                                                stop | samples [-o FILE.raw] | ram PAGE ADDR LEN [-o FILE] |
+                                                wram PAGE ADDR HEXBYTES | watch MS MASK [RAMADDR] |
+                                                mod MS HZ STEPS [PAGE REG] |
+                                                music MS HZ AMP [le]
+    rfoundry_debug.py air status|close|restart|abort  the air interface on the bench (CONFIG_AIR_RAW; debuglink.md 3.28)
+    rfoundry_debug.py air tap --seconds S --out F.raw [--bits 8|16]   the receive tap's samples
+    rfoundry_debug.py air open --profile p25 [--dev HZ] [--hard-only]  a session on the board's provider
+    rfoundry_debug.py air rx --seconds S --out F.jsonl                 its receive chunks
+    rfoundry_debug.py air tx --syms F [--max-ms MS]                    send the file's symbols (the radio core keys)
+    rfoundry_debug.py split view                     the split duplex view (role, epoch, offset, buffers, underruns, CACH)
+    rfoundry_debug.py split variant N [REG=VAL ...]  the BS framing experiment's variant for the next TX half key-up
+                                                (docs/spec/split-duplex.md 10.1; raw page 4 pairs with N = 255)
+
+Key names: up down left right select (ok) back (exit) quick (star) context (hash) 0-9 ptt monitor tt (talk target)
+emergency enc user1-user4.
+
+The port is found by its USB ID 1FC9:0094 (the only one present), else a radio in USB network mode answering over UDP;
+--port or $RFOUNDRY_PORT picks one. A serial port needs pyserial (pip install pyserial). Exit status 0 on success, 1 on
+a radio error, 2 on a usage or connection problem.
+"""
+import argparse
+import json
+import os
+import socket
+import struct
+import sys
+import time
+import zlib
+
+try:
+    import serial
+    from serial.tools import list_ports
+except ImportError:          # the module is still importable for its pure helpers (PNG, parsing)
+    serial = None
+    list_ports = None
+
+VID, PID = 0x1FC9, 0x0094
+SOF1, SOF2 = 0xA5, 0x5A
+HDR = 6
+REQ_MAX = 64
+INJECT_MAX_S = 10.0
+
+PING, VERSION, GET_DIAG, RESET_COUNTERS, SCREENSHOT, KEY, PTT, GET_LOG, GET_VIEW, RADIO, INFO_CHIP, READ_MEM, \
+    REBOOT = range(1, 14)
+DMR_DATA = 0x0E
+STORAGE = 0x0F
+SPLIT = 0x15                        # split duplex (CONFIG_HOTSPOT_SPLIT builds only; docs/spec/debuglink.md 3.15)
+SPLIT_OP_VARIANT, SPLIT_OP_VIEW = 1, 2
+APRS = 0x11
+APRS_OP_SEND_NOW, APRS_OP_STATUS, APRS_OP_MESSAGE, APRS_OP_TEST_CALL, APRS_OP_SET, APRS_OP_NMEA = range(1, 7)
+CRASH = 0x1B                        # the crash log (CONFIG_CRASH_LOG; docs/spec/debuglink.md 3.19)
+CRASH_OP_CLEAR, CRASH_OP_TEST = range(2)
+HWOPT = 0x21                        # the board's hardware options (docs/spec/debuglink.md 3.25)
+HWOPT_OP_LIST, HWOPT_OP_SET = range(2)
+AIR = 0x24                          # the air interface on the bench (CONFIG_AIR_RAW; docs/spec/debuglink.md 3.28)
+AIR_OP_STATUS, AIR_OP_TAP_START, AIR_OP_TAP_READ, AIR_OP_TAP_STOP, AIR_OP_OPEN, AIR_OP_CLOSE, AIR_OP_RX_READ, \
+    AIR_OP_RX_RESTART, AIR_OP_TX_DATA, AIR_OP_TX_KEY, AIR_OP_TX_END, AIR_OP_TX_ABORT = range(12)
+AIR_OPEN_SOFT = 0x01
+AIR_TX_LAST = 0x01
+AIR_FIT = {0x1: "rx", 0x2: "tx", 0x4: "soft", 0x8: "shape_approx", 0x10: "dev_approx", 0x20: "rate_doubled",
+           0x40: "needs_sync", 0x80: "tdma", 0x100: "full_duplex", 0x8000: "untested"}
+AIR_CHUNK_FLAGS = {0x1: "gap", 0x2: "free_run", 0x4: "slot", 0x8: "no_signal"}
+# Profiles by name (hal_air.h air_profile_t). p25: conventional P25 Phase 1 C4FM (core/p25/p25_rx.c)
+AIR_PROFILES = {
+    "p25": {"sym_rate": 4800, "levels": 4, "shape": 1, "shape_param": 20, "dev_outer_hz": 1800, "timing": 0, "bw": 0,
+            "slot_syms": 0, "sync_every_syms": 864, "idle": 0x5F,
+            "syncs": [{"id": 0, "nsyms": 24, "max_errs": 4, "flags": 0, "frame_at": 0,
+                       "syms": bytes([0x55, 0x75, 0xF5, 0xFF, 0x77, 0xFF])}]},
+}
+CRASH_TESTS = {"trap": 1, "assert": 2, "hang": 3, "stall": 4}
+CRASH_TOKEN = 0x48535243            # 'CRSH'
+WATCHDOG = 0x1D                     # the hardware watchdog's bench tests (CONFIG_WATCHDOG; docs/spec/debuglink.md 3.21)
+WDT_OP_CLEAR_GAP, WDT_OP_TEST, WDT_OP_LOAD = range(3)
+WDT_TESTS = {"starve": 1, "spin": 2, "irq-off": 3}
+WDT_TOKEN = 0x474F4457              # 'WDOG'
+WDT_LEAVE = 0xFFFFFFFF              # load: keep RST_LOAD
+RX2 = 0x1E                          # the second receiver's SoC: info, update bridge, restart (docs/spec/debuglink.md 3.22)
+RX2_OP_INFO, RX2_OP_BRIDGE, RX2_OP_RESTART = range(3)
+RX2_TOKEN = 0x47445242              # 'BRDG'
+RX2_FLAGS = {1: "present", 2: "up", 4: "bridge", 8: "restart"}
+IDDB = 0x1F                         # the DMR ID database: format, records, an ID looked up (docs/spec/debuglink.md 3.23)
+CHIP_REG = 0x20                     # an RF chip or SoC register read or written (docs/spec/debuglink.md 3.24)
+T3 = 0x22                           # a Tier III trunked system: stage, select, leave (docs/spec/debuglink.md 3.26)
+T3_RESET, T3_SYSTEM, T3_CTRL, T3_CHAN, T3_TG, T3_SITE, T3_PLAN, T3_START, T3_STOP, T3_DEREG, T3_END, \
+    T3_STATUS, T3_SDATA, T3_AUTH, T3_PS, T3_DIVERT, T3_ALS, T3_INTERRUPT, T3_SDPOLL, T3_POLL_REPLY, T3_LOAD, T3_SUPL, \
+    T3_DIAL = range(1, 24)
+T3_UDTF = {"binary": 0, "address": 1, "bcd": 2, "iso7": 3, "iso8": 4, "nmea": 5, "ip": 6, "utf16": 7}
+T3_TG_LISTEN, T3_TG_TALK, T3_TG_BROADCAST = 1, 2, 4
+T3_DIV = {"voice": 8, "pdata": 4, "sdata": 2, "status": 1}  # call diversion services (T3_DIV_*)
+T3_PAR = {"a": 1, "b": 2}
+CPKV = 0x23                         # a key of the codeplug settings area (docs/spec/debuglink.md 3.27)
+CPKV_GET, CPKV_SET, CPKV_REMOVE = 1, 2, 3
+# Codeplug settings-area keys of the mode records (docs/spec/channel-modes.md): system n, a system entry, system n's
+# secret, channel c's tag (+ c - 1); a system record's flags; a tag's flags; the Tier III kind and system type
+CPKV_SYSTEM, CPKV_SYS_CHAN, CPKV_SYS_KEY, CPKV_CH_TAG = 0x0100, 0x0200, 0x0300, 0x0400
+SYS_NEEDS_KEY, SYS_TX = 0x01, 0x02
+TAG_TX, TAG_BASE_OWN, TAG_FALLBACK = 0x01, 0x02, 0x04
+KIND_DMR_TRUNK = SYSTYPE_DMR_TRUNK = 1
+T3_TAG_NO_FALLBACK = 0x10                   # a trunked channel's tag: never fall back
+T3_SYS_STUN = 0x0400                        # a Tier III system's option: accept a stun
+CHIP_SOC = 0xFF                     # CHIP_REG's chip number for the SoC's own registers
+SNMP = 0x19                         # the SNMP agent (CONFIG_SNMP; docs/spec/debuglink.md 3.17, docs/spec/snmp.md)
+SNMP_OP_SET, SNMP_OP_COMMUNITY, SNMP_OP_TEST_TRAP = range(3)
+SNMP_FIELDS = {"flags": 0, "rf_manager": 1, "rf_gap_s": 2, "trap_port": 3}
+# SNMP_CFG_* bits (core/snmp/snmpMib.h)
+SNMP_FLAGS = {"off": 0x01, "rf_off": 0x02, "rf_write": 0x04, "usb_traps_off": 0x08, "auth_traps": 0x10,
+              "rf_call_traps": 0x20}
+# DL_APRS_OP_SET fields (core/debuglink/debuglink_proto.h)
+APRS_FIELDS = {name: i for i, name in enumerate(
+    ["tx", "region", "freq_hz", "ssid", "lat", "lon", "pos_src", "interval_s", "smart", "via", "dmr_dst", "level",
+     "path", "kiss", "dmr_udt", "after_ptt", "distance_m", "rx", "igate", "igate_tx", "digi", "txdelay",
+     "dmr_gps", "to_is", "power", "ambiguity"])}
+APRS_REGIONS = {"na": 0, "eu": 1, "au": 2, "nz": 3, "jp": 4, "cn": 5, "custom": 6}
+APRS_POS_SRCS = {"auto": 0, "gps": 1, "host": 2, "fixed": 3}
+APRS_VIAS = {"rf": 0, "dmr": 1, "both": 2}
+STORAGE_OP_INFO, STORAGE_OP_READ, STORAGE_OP_CLAIM = range(3)
+AUDIO_PROBE = 0x10
+(PROBE_STATUS, PROBE_REG_READ, PROBE_REG_WRITE, PROBE_START, PROBE_STOP, PROBE_SAMPLES, PROBE_RAM_READ,
+ PROBE_RAM_WRITE, PROBE_WATCH, PROBE_MUSIC, PROBE_MOD, PROBE_RAMFEED, PROBE_PIN_TONE, PROBE_PIN_SCAN, PROBE_PIN_PWM) = range(15)
+PROBE_RAM_CHUNK = 56          # bytes per RAM_WRITE request (request payload 64: op, page, address, data)
+PROBE_RAM_READ_MAX = 1000
+PROBE_NO_RAM = 0xFFFF
+PROBE_BLOCK = 160
+REGIONS = {0: "none", 1: "ours", 2: "foreign"}
+DATA_OP_SMS, DATA_OP_CALL_ALERT, DATA_OP_RADIO_CHECK, DATA_OP_SETTINGS, DATA_OP_INBOX, DATA_OP_MARK_READ = range(1, 7)
+DATA_OP_EMERGENCY, DATA_OP_EMERGENCY_SETTINGS = 7, 8
+DATA_OP_IP_SETTINGS, DATA_OP_IP_SEND, DATA_OP_TX_SPACING, DATA_OP_IP_CONFIRMED_RATE = 9, 10, 11, 12
+IP_COMPRESS = {"off": 0, "auto": 1, "all": 2}
+IP_CONFIRMED = {"off": 0, "rules": 1, "all": 2}
+IP_RULE_PORT = 0x80000000
+IP_SEND_MAX = REQ_MAX - 10          # op, u32 destination, flags, two u16 ports
+EMERGENCY_MODES = {"alarm": 0, "alarm_call": 1, "call": 2}
+SMS_TEXT_MAX = REQ_MAX - 6          # op, u32 destination, flags
+CMD_ERROR = 0xFF
+STATUS = {0: "ok", 1: "unknown command", 2: "bad argument", 3: "busy", 4: "unavailable", 5: "bad CRC",
+          6: "request too long", 7: "refused"}
+ST_REFUSED = 7
+MEM_READ_MAX = 1000
+REBOOT_NORMAL, REBOOT_ROM_DFU = 0, 1
+REBOOT_REASONS = {1: "wrong confirmation token (not the chip UID's low word)",
+                  2: "RDP is not level 0: the ROM bootloader would refuse flash access and its unprotect mass-erases "
+                     "everything, the stock bootloader included",
+                  3: "transmitting", 4: "chip info unreadable", 5: "could not arm the ROM DFU flag"}
+# STM32F405 sectors: (start, size)
+F4_SECTORS = [(0x08000000 + i * 0x4000, 0x4000) for i in range(4)] + [(0x08010000, 0x10000)] + \
+    [(0x08020000 + i * 0x20000, 0x20000) for i in range(7)]
+ST_OK, ST_BAD_ARG, ST_BUSY, ST_UNAVAILABLE = 0, 2, 3, 4
+SHOT_LZ4 = 3            # SCREENSHOT's packed form (debuglink.md 3.3)
+SHOT_HDR = 28           # its reply bytes before the palette, status included
+
+ACTIONS = {"up": 1, "down": 2, "left": 3, "right": 4, "select": 5, "ok": 5, "green": 5, "back": 6, "exit": 6,
+           "red": 6, "quick": 7, "star": 7, "context": 8, "hash": 8, "ptt": 19, "monitor": 20, "tt": 21,
+           "talk_target": 21, "emergency": 22, "enc": 23, "user1": 24, "user2": 25, "user3": 26, "user4": 27,
+           "vfo_toggle": 37}
+ACTIONS.update({str(d): 9 + d for d in range(10)})
+PRESS, LONG, REPEAT, DOWN, UP = range(5)
+
+VIEW_SECTIONS = ["core", "channel", "dmr", "dmr_call", "dmr_stats", "hotspot", "link", "features", "dmr_data",
+                 "storage", "dmr_ext", "dmr_data_stats", "roam", "aprs", "aprs_set", "dmr_ip", "net", "snmp", "usrp",
+                 "sfr", "tasks", "crash", "watchdog", "reset", "air", "net_svc", "net_link", "cps", "board", "audio", "t3",
+                 "t3_svc", "t3_roam", "voice_cap", "t3_msg", "t3_ra", "p25", "p25_trunk", "nxdn", "ysf"]
+
+OP_CHANNEL_STEP, OP_ZONE_POS, OP_ZONE, OP_VFO, OP_VFO_SET, OP_VFO_STEP, OP_POWER, OP_SQUELCH, OP_BANDWIDTH, \
+    OP_TONE, OP_MONITOR, OP_CLEAR_TEMP, OP_REPLY_CANCEL, OP_HOTSPOT_EXIT, OP_DMR_TARGET, OP_DMR_CONTACT, \
+    OP_DMR_CALL_BACK, OP_DMR_TARGET_CLEAR, OP_DMR_PRIVACY = range(1, 20)
+PRIVACY_TYPES = {"off": 0, "moto": 1, "anytone": 2}
+TONE_TYPES = {"none": 0, "ctcss": 1, "dcs": 2, "dcs_inv": 3}
+# The radio features (docs/spec/radio-features.md, debuglink.md 3.8)
+OP_SCAN, OP_SCAN_VFO, OP_BEEP, OP_TONE_BURST, OP_SETTING = range(20, 25)
+OP_USB_NETWORK = 25
+OP_ROAM = 26
+OP_USB_NET_SETTINGS = 27
+OP_VIBRATE = 29
+OP_VOLUME = 30
+OP_DMR_FIELDS = 31
+OP_VFO_COPY = 32
+OP_VOICE_TEST = 33
+OP_VOICE_CAPTURE = 41
+OP_DTMF = 34
+OP_TX_LIMIT = 35
+OP_TX_DRIVE = 36
+OP_PA_KEYUP = 37
+OP_VFO_SFR = 38
+OP_P25 = 42
+OP_NXDN = 43
+OP_YSF = 44
+P25_TALKAROUND = {"auto": 0, "on": 1, "off": 2}
+CHANNEL_MODES = {"fm": 0, "dmr": 1, "p25": 2, "nxdn": 3, "ysf": 4}
+YSF_DATA_TYPES = {"vd1": 0, "data": 1, "dn": 2, "vw": 3}
+# The VFO's SFR role names (sfrRole_t, docs/spec/sfr.md 4): off, user, user of an ERDM repeater, repeater, ERDM style
+SFR_ROLES = {"off": 0, "user": 1, "user-erdm": 2, "rpt": 3, "rpt-erdm": 4}
+OP_PA_SWEEP = 39
+OP_PA_KEYRUN = 40
+PA_KEYRUN_MAX = 21       # keys in one key run with the constants (28 without): a request is 64 bytes
+TX_LIMIT_MAX = 10       # frequencies in the test TX limit's list (core/radio/tx_limit.h)
+DTMF_DIGITS = "0123456789*#ABCD"
+VOLUME_KNOB = 0xFF
+OP_PPP = 28
+ROAM_CMDS = {"zone_off": 0, "zone_on": 1, "zone_toggle": 2, "now": 3, "lock": 4, "unlock": 5, "lock_toggle": 6}
+SCAN_CMDS = {"stop": 0, "zone": 1, "vfo": 2, "dual": 3, "cancel": 4, "nuisance": 5, "toggle": 6, "select": 7}
+BEEPS = {"key": 1, "error": 2, "tx_permit": 3, "tx_deny": 4, "call_end": 5, "tot_warn": 6, "battery_low": 7,
+         "battery_crit": 8, "scan_hold": 9}
+SWEEP = 13      # the speaker test's sweep (beep.h BEEP_SWEEP): not a beep a user hears, so not in BEEPS
+VIBES = {"message": 1, "call": 2, "emergency": 3}
+SETTINGS = {"tot_s": 1, "tot_warn_s": 2, "bcl": 3, "roger_beep": 4, "tx_inhibit": 5, "scan_resume": 6,
+            "scan_hold_s": 7, "scan_delay_ms": 8, "scan_dwell_ms": 9, "scan_priority": 10, "beep_level": 11,
+            "key_beep": 12, "vox": 13, "vox_level": 14, "vox_tail_ms": 15, "rx_save": 16, "rx_save_idle_s": 17,
+            "battery_off_s": 18, "scan_beep": 19, "reply_s": 20, "roam_rssi_dbm": 21, "roam_hyst_db": 22,
+            "roam_probe": 23, "roam_check_s": 24, "roam_beacon_s": 25, "roam_beacon_len_s": 26, "roam_survey": 27,
+            "rpt_beacon": 28, "mic_gain": 29, "dual_delay_ms": 30, "enc_options": 31,
+            "zs_offers": 32, "sfr_cwid": 33, "sfr_rx": 34, "ref_trim": 35,
+            "tones_off": 36, "gps": 37}
+
+
+class DebugLinkError(Exception):
+    """The radio answered with an error status, or didn't answer."""
+
+    def __init__(self, msg, status=None, data=b""):
+        super().__init__(msg)
+        self.status = status
+        self.data = data
+
+
+def crc16(data, crc=0xFFFF):
+    """CRC-16/CCITT-FALSE."""
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def frame(cmd, seq, payload=b""):
+    body = bytes([cmd, seq]) + struct.pack("<H", len(payload)) + bytes(payload)
+    return bytes([SOF1, SOF2]) + body + struct.pack("<H", crc16(body))
+
+
+def parse_kv(text):
+    """key=value lines into a dict (values as strings; see as_int)."""
+    out = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip()] = v
+    return out
+
+
+def as_int(v, default=None):
+    try:
+        return int(v, 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def find_network_radios():
+    """udp:ADDR of each radio in USB network mode (the rfoundry package's discovery: tools/rfoundry/rfoundry/debuglink.py)"""
+    pkg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rfoundry")
+    if pkg not in sys.path:
+        sys.path.insert(0, pkg)
+    try:
+        from rfoundry.debuglink import find_network_radios as find
+    except ImportError:
+        return []
+    return find()
+
+
+def low_latency(s):
+    """A USB-serial cable's FTDI chip holds received bytes for its latency timer (16 ms) before passing them on; 1 ms
+    halves a request's round trip on a radio linked by the programming cable. Linux only; elsewhere, and on ports
+    without the setting, nothing changes."""
+    try:
+        s.set_low_latency_mode(True)
+    except (AttributeError, NotImplementedError, OSError, ValueError):
+        pass
+
+
+def find_ports():
+    if list_ports is None:
+        return []
+    return sorted(p.device for p in list_ports.comports() if p.vid == VID and p.pid == PID)
+
+
+# The USB-serial bridges of radios' programming cables (FTDI, Prolific, WCH, Silicon Labs): a radio on one of them has
+# no USB ID of its own, so find_ports() can't see it
+CABLE_VIDS = (0x0403, 0x067B, 0x1A86, 0x10C4)
+
+
+def find_cables():
+    if list_ports is None:
+        return []
+    return sorted(p.device for p in list_ports.comports() if p.vid in CABLE_VIDS)
+
+
+# Commands (and their ops) that only read: everything else restarts the radio or changes it
+READ_ONLY = {"hwopt": None, "reg": None, "ping": None, "version": None, "diag": None, "view": None, "screenshot": None, "log": None, "chip": None,
+             "dump": None, "peek": None, "iddb": None, "crash": ("show",), "watchdog": ("show",), "rx2": ("info",),
+             "air": ("status", "tap", "rx"), "storage": ("info", "dump"), "split": ("view",),
+             "aprobe": ("status", "reg", "samples", "ram", "watch")}
+
+
+def changes_radio(a):
+    """The parsed command restarts the radio or writes to it (settings, registers, keys, PTT, the radio's state)"""
+    if a.cmd not in READ_ONLY:
+        return True
+    ops = READ_ONLY[a.cmd]
+    if a.cmd == "hwopt":
+        return a.choice is not None
+    if a.cmd == "reg":
+        return a.value is not None
+    return ops is not None and getattr(a, "op", None) not in ops
+
+
+def pick_port(port=None, changes=False):
+    """The radio's port: port, $RFOUNDRY_PORT, else the one radio found. changes: the command restarts or writes to the
+    radio, so a serial cable that may carry another radio counts too: never guess which one"""
+    port = port or os.environ.get("RFOUNDRY_PORT")
+    if port:
+        return port
+    ports = find_ports() or find_network_radios()	# no serial port: a radio in USB network mode, over UDP
+    if changes:
+        cables = [c for c in find_cables() if c not in ports]
+        if len(ports) + len(cables) > 1:
+            raise DebugLinkError(f"this command restarts or writes to the radio, and more than one may be attached "
+                                 f"(radios {ports}, serial cables {cables}): give --port")
+    if len(ports) == 1:
+        return ports[0]
+    if not ports:
+        raise DebugLinkError("no radio found (USB 1FC9:0094, or a network adapter radio answering on UDP): is it plugged "
+                             "in and powered on? Or give --port")
+    raise DebugLinkError(f"several radios found {ports}: give --port")
+
+
+class UdpPort:
+    """The debug link over UDP, for a radio in USB network mode (docs/spec/usb-network.md): the radio's serial
+    protocols on UDP port 3334 of its own address. Looks enough like a pyserial port for DebugLink."""
+
+    def __init__(self, host, port=3334, timeout=0.02):
+        import socket
+        self.addr = (socket.gethostbyname(host), port)     # a name (rfoundry-<id>.local, docs/spec/mdns.md) resolved once
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(timeout)
+        self.pending = bytearray()
+
+    @property
+    def in_waiting(self):
+        return len(self.pending)
+
+    def read(self, n=1):
+        if not self.pending:
+            try:
+                data, _ = self.sock.recvfrom(2048)
+                self.pending += data
+            except OSError:
+                return b""
+        out = bytes(self.pending[:n])
+        del self.pending[:n]
+        return out
+
+    def write(self, data):
+        self.sock.sendto(bytes(data), self.addr)
+        return len(data)
+
+    def close(self):
+        self.sock.close()
+
+
+class DebugLink:
+    """One open debug link. All methods raise DebugLinkError on an error status or a time-out."""
+
+    def __init__(self, port=None, timeout=1.0, s=None):
+        """s: an open port-like object (read, write, in_waiting, close) instead of opening one: tests."""
+        self.timeout = timeout
+        self.seq = 0
+        self.buf = bytearray()
+        self.packed_shots = None                # packed screenshots: None until the firmware says
+        if s is not None:
+            self.port, self.s = str(port or "test"), s
+            return
+        if serial is None and not str(port or "").startswith("udp:"):
+            raise DebugLinkError("needs pyserial: pip install pyserial")
+        self.port = pick_port(port)
+        if self.port.startswith("udp:"):        # udp:<radio IP>[:port], a radio in USB network mode
+            host, _, udp_port = self.port[4:].partition(":")
+            self.s = UdpPort(host, int(udp_port or 3334))
+        else:
+            try:
+                self.s = serial.serial_for_url(self.port, 115200, timeout=0.02)	# a device, or a URL such as rfc2217://host:port
+            except serial.SerialException as e:
+                raise DebugLinkError(f"can't open {self.port}: {e}")
+            low_latency(self.s)
+
+    def close(self):
+        self.s.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    # ── transport ──
+    def _read_frame(self, deadline):
+        while time.monotonic() < deadline:
+            self.buf += self.s.read(max(1, self.s.in_waiting or 1))
+            while True:
+                i = self.buf.find(bytes([SOF1, SOF2]))
+                if i < 0:
+                    del self.buf[:-1]       # other protocols' bytes (MMDVM frames heard on air) are skipped
+                    break
+                del self.buf[:i]
+                if len(self.buf) < HDR:
+                    break
+                n = self.buf[4] | (self.buf[5] << 8)
+                if n > 1024:                # can't be ours: resync past this SOF
+                    del self.buf[:1]
+                    continue
+                if len(self.buf) < HDR + n + 2:
+                    break
+                f = bytes(self.buf[:HDR + n + 2])
+                body = f[2:HDR + n]
+                if crc16(body) != (f[HDR + n] | (f[HDR + n + 1] << 8)):
+                    del self.buf[:1]
+                    continue
+                del self.buf[:HDR + n + 2]
+                return f[2], f[3], f[HDR:HDR + n]
+        return None
+
+    def request(self, cmd, payload=b"", timeout=None, busy_wait=2.0):
+        """(status, data) of a command; retries a busy answer for up to busy_wait seconds. Raises on errors other
+        than busy after the wait."""
+        if len(payload) > REQ_MAX:
+            raise DebugLinkError(f"request payload {len(payload)} > {REQ_MAX}")
+        timeout = self.timeout if timeout is None else timeout
+        end_busy = time.monotonic() + busy_wait
+        while True:
+            self.seq = (self.seq + 1) & 0xFF
+            seq = self.seq
+            self.s.write(frame(cmd, seq, payload))
+            deadline = time.monotonic() + timeout
+            while True:
+                r = self._read_frame(deadline)
+                if r is None:
+                    raise DebugLinkError(f"no answer to command 0x{cmd:02X} within {timeout} s on {self.port} "
+                                         "(firmware without the debug link? another program has the port?)")
+                rcmd, rseq, data = r
+                if rseq != seq:
+                    continue                # a late answer to an earlier request
+                if rcmd == CMD_ERROR:
+                    st = data[0] if data else None
+                    raise DebugLinkError(f"command 0x{cmd:02X}: {STATUS.get(st, st)}", st)
+                if rcmd == (cmd | 0x80):
+                    break
+            st = data[0] if data else None
+            if st == ST_BUSY and time.monotonic() < end_busy:
+                time.sleep(0.03)
+                continue
+            if st != ST_OK:
+                raise DebugLinkError(f"command 0x{cmd:02X}: {STATUS.get(st, st)}", st, bytes(data[1:]))
+            return st, data[1:]
+
+    # ── commands ──
+    def ping(self, data=b"rfoundry"):
+        t = time.monotonic()
+        _, r = self.request(PING, data)
+        if r != data:
+            raise DebugLinkError(f"ping echo mismatch: {r!r}")
+        return time.monotonic() - t
+
+    def chip(self):
+        """INFO_CHIP decoded (dict)."""
+        return decode_chip(self.request(INFO_CHIP)[1])
+
+    def read_mem(self, addr, n):
+        _, r = self.request(READ_MEM, struct.pack("<IH", addr, n))
+        (raddr,) = struct.unpack_from("<I", r)
+        if raddr != addr or len(r) - 4 != n:
+            raise DebugLinkError(f"READ_MEM answer for 0x{raddr:08X} with {len(r) - 4} bytes, asked 0x{addr:08X} {n}")
+        return bytes(r[4:])
+
+    def storage_info(self):
+        """STORAGE INFO: region state and the (address, size) of the settings ring, journal, calibration copy"""
+        _, r = self.request(STORAGE, bytes([STORAGE_OP_INFO]))
+        region, pending = r[0], r[1]
+        sa, ss, ja, js, ca, cs = struct.unpack_from("<6I", r, 2)
+        return {"region": REGIONS.get(region, str(region)), "claim_pending": bool(pending),
+                "ranges": {"settings": (sa, ss), "journal": (ja, js), "calibration": (ca, cs)}}
+
+    # ── audio probe (CONFIG_AUDIO_PROBE, docs/spec/debuglink.md 3.14) ──
+    def probe_status(self):
+        """Levels of the last PCM block on both I2S channels (peak, RMS and peak since start, full scale 32767)."""
+        _, r = self.request(AUDIO_PROBE, bytes([PROBE_STATUS]))
+        flags, blocks = r[0], struct.unpack_from("<I", r, 1)[0]
+        lp, lr, lm, rp, rr, rm = struct.unpack_from("<6H", r, 5)
+        return {"ours": bool(flags & 1), "running": bool(flags & 2), "no_pcm": bool(flags & 4), "blocks": blocks,
+                "voice": "dmr" if flags & 8 else "p25" if flags & 16 else None,
+                "left": {"peak": lp, "rms": lr, "peak_max": lm}, "right": {"peak": rp, "rms": rr, "peak_max": rm}}
+
+    def probe_reg(self, page, reg, value=None):
+        """Read (value None) or write one audio chip register; returns what it reads back."""
+        if value is None:
+            _, r = self.request(AUDIO_PROBE, bytes([PROBE_REG_READ, page, reg]))
+        else:
+            _, r = self.request(AUDIO_PROBE, bytes([PROBE_REG_WRITE, page, reg, value & 0xFF]))
+        return r[0]
+
+    def probe_start(self, hz=0, amplitude=0, speaker=False):
+        """Run the PCM stream with the probe's callback, sending a hz tone at amplitude (0: silence)."""
+        self.request(AUDIO_PROBE, struct.pack("<BHHB", PROBE_START, hz, amplitude, 1 if speaker else 0))
+
+    def probe_stop(self):
+        self.request(AUDIO_PROBE, bytes([PROBE_STOP]))
+
+    def probe_samples(self):
+        """(blocks, left, right): the last 20 ms block of both channels as lists of ints."""
+        _, r = self.request(AUDIO_PROBE, bytes([PROBE_SAMPLES]))
+        (blocks,) = struct.unpack_from("<I", r)
+        x = struct.unpack_from(f"<{2 * PROBE_BLOCK}h", r, 4)
+        return blocks, list(x[:PROBE_BLOCK]), list(x[PROBE_BLOCK:])
+
+    def probe_ram(self, page, addr, n=None, data=None):
+        """Read n bytes (data None) or write data at an 11-bit address of the audio chip's RAM; returns the bytes read."""
+        if data is None:
+            out = b""
+            while len(out) < n:
+                k = min(PROBE_RAM_READ_MAX, n - len(out))
+                _, r = self.request(AUDIO_PROBE, struct.pack("<BBHH", PROBE_RAM_READ, page, addr + len(out), k))
+                out += bytes(r[:k])
+            return out
+        for i in range(0, len(data), PROBE_RAM_CHUNK):
+            self.request(AUDIO_PROBE, struct.pack("<BBH", PROBE_RAM_WRITE, page, addr + i) + bytes(data[i:i + PROBE_RAM_CHUNK]))
+        return None
+
+    def probe_music(self, ms, hz, amplitude, little_endian=False):
+        """Feed the audio chip's prompt tone FIFO with a tone for ms (<= 2000); the caller opens the path (HR_C6000
+        0x06 bit 1). Returns {writes, polls, elapsed_ms}."""
+        _, r = self.request(AUDIO_PROBE, struct.pack("<BHHHB", PROBE_MUSIC, ms, hz, amplitude, 1 if little_endian else 0),
+                            timeout=ms / 1000 + 2)
+        writes, polls, elapsed = struct.unpack_from("<HHI", r)
+        return {"writes": writes, "polls": polls, "elapsed_ms": elapsed}
+
+    def probe_mod(self, ms, hz, amplitude, page=4, reg=0x04, shaped=False):
+        """Play a hz tone of amplitude register steps into a register for ms (<= 2000), written back to back around
+        its signed value (shaped: second order noise shaping), then restored. Returns {writes, elapsed_ms, base}."""
+        _, r = self.request(AUDIO_PROBE, struct.pack("<BHBBHBB", PROBE_MOD, ms, page, reg, hz, amplitude,
+                                                     1 if shaped else 0), timeout=ms / 1000 + 2)
+        writes, elapsed = struct.unpack_from("<II", r)
+        return {"writes": writes, "elapsed_ms": elapsed, "base": r[8]}
+
+    def probe_ramfeed(self, hold_ms, gap_ms, hz, amplitude, flips):
+        """Keep a big endian hz tone in the TX RAM FM halves behind the codec while applying each flip (page, register,
+        xor mask) for hold_ms with gap_ms between (and first). Up to 16 flips, 9 s in all. Returns {switches,
+        writes, max_lag_ms, done}."""
+        req = struct.pack("<BHHHHB", PROBE_RAMFEED, hold_ms, gap_ms, hz, amplitude, len(flips))
+        req += b"".join(bytes([p, r, m]) for p, r, m in flips)
+        total = len(flips) * (hold_ms + gap_ms) + gap_ms
+        _, r = self.request(AUDIO_PROBE, req, timeout=total / 1000 + 3)
+        switches, writes, lag = struct.unpack_from("<HHH", r)
+        return {"switches": switches, "writes": writes, "max_lag_ms": lag, "done": r[6]}
+
+    def probe_pin_tone(self, hz):
+        """A hz square wave on the board's spare output (hal_audio_tap.h); 0 = off."""
+        self.request(AUDIO_PROBE, struct.pack("<BH", PROBE_PIN_TONE, hz))
+
+    def probe_pin_pwm(self, top, hz, amp_permille):
+        """PWM audio on the board's spare output: a carrier of top + 1 counts of 72 MHz, its duty a hz sine of
+        amp_permille (0-1000) around 50 %; hz 0 = off. Returns the carrier in Hz (0: not running)."""
+        _, r = self.request(AUDIO_PROBE, struct.pack("<BHHH", PROBE_PIN_PWM, top, hz, amp_permille))
+        return struct.unpack_from("<I", r)[0]
+
+    def probe_pin_scan(self, ms):
+        """Sample the MCU's GPIO inputs for ms (<= 2000). Returns {"A": mask, "B": mask, ...} of the pins that changed."""
+        _, r = self.request(AUDIO_PROBE, struct.pack("<BH", PROBE_PIN_SCAN, ms), timeout=ms / 1000 + 2)
+        return {"ABCDEFGH"[i]: struct.unpack_from("<H", r, 1 + 2 * i)[0] for i in range(r[0])}
+
+    def probe_watch(self, ms, mask, page=4, flag_reg=0x82, clear_reg=0x83, ram_page=2, ram_addr=PROBE_NO_RAM):
+        """Poll an interrupt flag register for ms (<= 2000), counting and clearing the flags in mask, and count the
+        changes of the RAM word at ram_addr. Returns {elapsed_ms, polls, bits: {bit: (count, first_ms)}, ram_changes}."""
+        _, r = self.request(AUDIO_PROBE, struct.pack("<BHBBBBBH", PROBE_WATCH, ms, page, flag_reg, clear_reg, mask,
+                                                     ram_page, ram_addr), timeout=ms / 1000 + 2)
+        elapsed, polls = struct.unpack_from("<IH", r)
+        bits = {b: struct.unpack_from("<HH", r, 6 + 4 * b) for b in range(8)}
+        (changes,) = struct.unpack_from("<H", r, 38)
+        return {"elapsed_ms": elapsed, "polls": polls, "bits": bits, "ram_changes": changes}
+
+    def storage_read(self, addr, n):
+        out = bytearray()
+        while len(out) < n:
+            k = min(MEM_READ_MAX, n - len(out))
+            _, r = self.request(STORAGE, struct.pack("<BIH", STORAGE_OP_READ, addr + len(out), k))
+            (raddr,) = struct.unpack_from("<I", r)
+            if raddr != addr + len(out) or len(r) - 4 != k:
+                raise DebugLinkError(f"STORAGE READ answer for 0x{raddr:08X} with {len(r) - 4} bytes")
+            out += r[4:]
+        return bytes(out)
+
+    def split_variant(self, variant, regs=()):
+        """SPLIT op 1: the BS framing variant (0 ours, 1 the chip's, 255) and up to 4 (page 4 register, value) pairs
+        written after the variant's values"""
+        regs = list(regs)
+        if len(regs) > 4:
+            raise DebugLinkError("at most 4 register pairs")
+        payload = bytes([SPLIT_OP_VARIANT, variant & 0xFF, len(regs)]) + b"".join(bytes([r & 0xFF, v & 0xFF])
+                                                                              for r, v in regs)
+        self.request(SPLIT, payload)
+
+    def split_view(self):
+        """SPLIT op 2: the split duplex view as a dict (status 1 'unknown command' without CONFIG_HOTSPOT_SPLIT)"""
+        return parse_kv(self.request(SPLIT, bytes([SPLIT_OP_VIEW]))[1].decode("ascii", "replace"))
+
+    def storage_claim(self, token):
+        """Raises DebugLinkError (status 7 with the reason, or 4: not foreign) when refused"""
+        self.request(STORAGE, struct.pack("<BI", STORAGE_OP_CLAIM, token))
+
+    def dump(self, addr, n, progress=None):
+        out = bytearray()
+        while len(out) < n:
+            k = min(MEM_READ_MAX, n - len(out))
+            out += self.read_mem(addr + len(out), k)
+            if progress:
+                progress(len(out), n)
+        return bytes(out)
+
+    def reboot(self, mode, token):
+        """Ask for a reboot; raises DebugLinkError (status 7, data = reason) when the firmware refuses."""
+        self.request(REBOOT, struct.pack("<BI", mode, token))
+
+    def crash_clear(self):
+        self.request(CRASH, bytes([CRASH_OP_CLEAR]))
+
+    def crash_test(self, kind):
+        """Crash on purpose (kind: 'trap', 'assert', 'hang' or 'stall'); the radio restarts about 100 ms after the reply
+        (a hang: about three quarters of the watchdog's timeout later, plus the fault trace on the HR_C7000; a stall:
+        the stall check's 60 s later, the link silent until then)."""
+        self.request(CRASH, struct.pack("<BBI", CRASH_OP_TEST, CRASH_TESTS[kind], CRASH_TOKEN))
+
+    def watchdog_clear_gap(self):
+        self.request(WATCHDOG, bytes([WDT_OP_CLEAR_GAP]))
+
+    def watchdog_test(self, kind):
+        """Stop the watchdog feeds (kind: 'starve', 'spin' or 'irq-off'); starts about 100 ms after the reply and ends in
+        a reset."""
+        self.request(WATCHDOG, struct.pack("<BBI", WDT_OP_TEST, WDT_TESTS[kind], WDT_TOKEN))
+
+    def watchdog_load(self, hi, lo, rst=WDT_LEAVE):
+        """HR_C7000: re-arm the watchdog with raw loads, then starve it (the bench measurement of its clock)."""
+        self.request(WATCHDOG, struct.pack("<BIIII", WDT_OP_LOAD, hi, lo, rst, WDT_TOKEN))
+
+    def rx2_info(self):
+        """The second receiver's SoC: a set of RX2_FLAGS names (empty on a radio with one SoC)."""
+        flags = self.request(RX2, bytes([RX2_OP_INFO]))[1][0]
+        return {name for bit, name in RX2_FLAGS.items() if flags & bit}
+
+    def rx2_bridge(self):
+        """Hand the cable to the second SoC: about 100 ms after the reply, the port carries its first stage's handshake
+        (stub/stubtool.py --board gd88b). The radio restarts once the host has been quiet for a while."""
+        self.request(RX2, struct.pack("<BI", RX2_OP_BRIDGE, RX2_TOKEN))
+
+    def rx2_restart(self):
+        self.request(RX2, struct.pack("<BI", RX2_OP_RESTART, RX2_TOKEN))
+
+    def hwopts(self):
+        """The board's hardware options: [{name, value (-1 = none stored), restart, choices, state}]; state ok, ask,
+        restart or hidden (a firmware without the key: ask while nothing is stored, else ok)"""
+        kv = parse_kv(self.request(HWOPT, bytes([HWOPT_OP_LIST]))[1].decode("ascii", "replace"))
+        out = []
+        for i in range(int(kv.get("hwopt.count", "0"))):
+            value = int(kv.get(f"hwopt.{i}.value", "-1"))
+            out.append({"name": kv.get(f"hwopt.{i}.name", ""), "value": value,
+                        "restart": kv.get(f"hwopt.{i}.restart") == "1",
+                        "choices": kv.get(f"hwopt.{i}.choices", "").split("|"),
+                        "state": kv.get(f"hwopt.{i}.state") or ("ask" if value < 0 else "ok")})
+        return out
+
+    def hwopt_set(self, option, choice):
+        """Store a choice; raises DebugLinkError (status 7) when the board refuses it or the radio transmits."""
+        self.request(HWOPT, bytes([HWOPT_OP_SET, option, choice]))
+
+    # ── the air interface (CONFIG_AIR_RAW, docs/spec/debuglink.md 3.28) ──
+    def air_status(self):
+        return parse_kv(self.request(AIR, bytes([AIR_OP_STATUS]))[1].decode("ascii", "replace"))
+
+    def air_tap_start(self, bits=16, shift=0):
+        """The board's receive tap on: {rate_hz, lo_hz, hi_hz, counts_per_khz, channels}"""
+        r = self.request(AIR, bytes([AIR_OP_TAP_START, bits, shift]))[1]
+        rate, lo, hi, cpk, ch = struct.unpack_from("<IHHHB", r)
+        return {"rate_hz": rate, "lo_hz": lo, "hi_hz": hi, "counts_per_khz": cpk, "channels": ch}
+
+    def air_tap_read(self, bits=16):
+        """(seq, t_us, gaps, samples as bytes: int16 LE, or int8)"""
+        r = self.request(AIR, bytes([AIR_OP_TAP_READ]))[1]
+        seq, t_us, gaps, n = struct.unpack_from("<IIIH", r)
+        return seq, t_us, gaps, bytes(r[14:14 + n * (2 if bits == 16 else 1)])
+
+    def air_tap_stop(self):
+        self.request(AIR, bytes([AIR_OP_TAP_STOP]))
+
+    def air_open(self, prof, soft=True):
+        """A session on the board's provider: {fit (names), tx_chunk_syms, tx_queue_depth}"""
+        b = struct.pack("<HBBBHBBHHBB", prof["sym_rate"], prof["levels"], prof["shape"], prof["shape_param"],
+                        prof["dev_outer_hz"], prof["timing"], prof["bw"], prof["slot_syms"], prof["sync_every_syms"],
+                        prof["idle"], len(prof["syncs"]))
+        for y in prof["syncs"]:
+            b += struct.pack("<BBBBb", y["id"], y["nsyms"], y["max_errs"], y["flags"], y["frame_at"]) + \
+                y["syms"].ljust(6, b"\0")
+        try:
+            r = self.request(AIR, bytes([AIR_OP_OPEN, AIR_OPEN_SOFT if soft else 0]) + b)[1]
+        except DebugLinkError as e:
+            if e.status == ST_REFUSED and len(e.data) >= 4:
+                fit = struct.unpack_from("<I", e.data)[0]
+                raise DebugLinkError(f"air open refused (fit {self._fit_names(fit) or 'none'})", e.status, e.data)
+            raise
+        fit, chunk, depth = struct.unpack_from("<IHB", r)
+        return {"fit": self._fit_names(fit), "tx_chunk_syms": chunk, "tx_queue_depth": depth}
+
+    @staticmethod
+    def _fit_names(fit):
+        return [n for bit, n in AIR_FIT.items() if fit & bit]
+
+    def air_close(self):
+        self.request(AIR, bytes([AIR_OP_CLOSE]))
+
+    def air_rx_read(self):
+        """(dropped, [records]): {t_us, nsyms, flags, sync_at, sync_id, hard (bytes), soft (list or None)}"""
+        r = self.request(AIR, bytes([AIR_OP_RX_READ]))[1]
+        dropped, count = struct.unpack_from("<IB", r)
+        at, out = 5, []
+        for _ in range(count):
+            t_us, nsyms, flags, sync_at, sync_id = struct.unpack_from("<IHBhB", r, at)
+            at += 10
+            hard = bytes(r[at:at + (nsyms + 3) // 4])
+            at += (nsyms + 3) // 4
+            soft = None
+            if flags & 0x80:
+                soft = list(struct.unpack_from(f"<{nsyms}b", r, at))
+                at += nsyms
+            out.append({"t_us": t_us, "nsyms": nsyms, "flags": flags & 0x7F, "sync_at": sync_at, "sync_id": sync_id,
+                        "hard": hard, "soft": soft})
+        return dropped, out
+
+    def air_rx_restart(self):
+        self.request(AIR, bytes([AIR_OP_RX_RESTART]))
+
+    def air_tx_data(self, syms, nsyms, last=False):
+        """Queue one chunk; the queue's free chunks after it, or None when it was full (try again)"""
+        try:
+            r = self.request(AIR, bytes([AIR_OP_TX_DATA, AIR_TX_LAST if last else 0, nsyms]) + syms, busy_wait=0)[1]
+        except DebugLinkError as e:
+            if e.status == ST_BUSY:
+                return None
+            raise
+        return r[0]
+
+    def air_tx_key(self, max_ms=0):
+        """The radio core keys the transmitter (its checks, the lowest power); refused or unavailable raise"""
+        self.request(AIR, struct.pack("<BH", AIR_OP_TX_KEY, max_ms))
+
+    def air_tx_end(self):
+        self.request(AIR, bytes([AIR_OP_TX_END]))
+
+    def air_tx_abort(self):
+        self.request(AIR, bytes([AIR_OP_TX_ABORT]))
+
+    def iddb(self, dmr_id=0):
+        """The DMR ID database as the radio sees it, and the text it shows for dmr_id: {format, records, found, text}"""
+        return decode_iddb(self.request(IDDB, struct.pack("<I", dmr_id))[1])
+
+    # A Tier III trunked system (docs/spec/debuglink.md 3.26): stage it with t3_reset, t3_system, t3_ctrl, t3_chan,
+    # t3_tg (t3_site, t3_plan), then t3_start. State: the t3 view section
+    def t3_op(self, op, args=b""):
+        self.request(T3, bytes([op]) + bytes(args))
+
+    def t3_reset(self):
+        self.t3_op(T3_RESET)
+
+    def t3_system(self, own_id=0, model=0, net=0, par="a", opts=0x20, cc=1, talk_id=0, talk_private=False, dmrla=0,
+                  leave_dbm=0, vote_ms=0, ip_gw=False):
+        """own_id 0: the radio's; model 0 tiny .. 3 huge; par a|b|1|2; opts T3_OPT_* (core/dmr/trunk/t3_ms.h): 0x01
+        listen only, 0x20 private calls to the radio, 0x40 register with the talkgroup, 0x200 no roaming; dmrla: the
+        SITE bits of a registration area; leave_dbm: a TSCC below it is left (0: the radio's roaming threshold);
+        vote_ms: the Vote Now sample (0: default); ip_gw: IP through the system's gateway (IPI), the radio's address
+        advised at registration"""
+        cat = T3_PAR[par] if isinstance(par, str) else par
+        self.t3_op(T3_SYSTEM, struct.pack("<IBHBHBIBBhHB", own_id, model, net, cat, opts, cc, talk_id, int(talk_private),
+                                          dmrla, leave_dbm, vote_ms, int(ip_gw)))
+
+    def t3_ctrl(self, lcn, rx_hz, tx_hz, cc=0xFF):
+        """A control channel candidate (also a channel of the plan); rx/tx as the radio sees them; cc 0xFF: the
+        system's"""
+        self.t3_op(T3_CTRL, struct.pack("<HIIB", lcn, rx_hz, tx_hz, cc))
+
+    def t3_chan(self, lcn, rx_hz, tx_hz, cc=0xFF):
+        self.t3_op(T3_CHAN, struct.pack("<HIIB", lcn, rx_hz, tx_hz, cc))
+
+    def t3_tg(self, tg, listen=True, talk=False, broadcast=False):
+        self.t3_op(T3_TG, struct.pack("<IB", tg, (T3_TG_LISTEN if listen else 0) | (T3_TG_TALK if talk else 0) |
+                                      (T3_TG_BROADCAST if broadcast else 0)))
+
+    def t3_auth(self, key=None, psn=0):
+        """The staged system's authentication key K (16 bytes) and PSN; None removes it. The radio never shows K."""
+        if key is None:
+            self.t3_op(T3_AUTH, b"")
+            return
+        if len(key) != 16:
+            raise DebugLinkError("t3 auth: K is 16 bytes")
+        self.t3_op(T3_AUTH, bytes(key) + struct.pack("<I", psn & 0xFFFFFF))
+
+    def t3_power_save(self, rq, awake_ms=0):
+        """Power save asked for at registration: PowerSave_RQ 0 (off) to 7 (1:128), T_Awake in ms (0: default)."""
+        self.t3_op(T3_PS, struct.pack("<BH", rq, awake_ms))
+
+    def t3_divert(self, to=0, group=False, services=("voice", "pdata", "sdata", "status"), clear=False,
+                  incoming=False):
+        """Call diversion: services to an MS or talkgroup; clear=True ends the radio's own, incoming=True every one
+        to the radio."""
+        mode = 2 if incoming else (0 if clear else 1)
+        bits = sum(T3_DIV[s] for s in services)
+        self.t3_op(T3_DIVERT, struct.pack("<BBIB", mode, bits, to, int(group)))
+
+    def t3_als(self, to=0, emergency=False, als_s=0, als_e_s=0):
+        """Ambient Listening: ask to listen to MS `to` (0: only set T_ALS / T_ALS_E, in s, 0 = default). The radio
+        answers ALS calls to it only with T3_OPT_ALS (0x80) in t3_system's opts."""
+        self.t3_op(T3_ALS, struct.pack("<IBHH", to, int(emergency), als_s, als_e_s))
+
+    def t3_interrupt(self, end_als=False):
+        """Stop the talker in the call followed: status 125 to it, then back to the call (t3.ax_result done =
+        accepted); end_als: end the ALS call the radio listens to (status 123; the radio stays on the TSCC)"""
+        self.t3_op(T3_INTERRUPT, struct.pack("<B", int(end_als)))
+
+    def t3_sdata_poll(self, dst, fmt="iso8", blocks=1):
+        """Poll MS dst for its short data (fmt a T3_UDTF name or number, 1-4 blocks): the answer shows as the last
+        message heard, t3.ax_result done"""
+        f = T3_UDTF[fmt] if isinstance(fmt, str) else fmt
+        self.t3_op(T3_SDPOLL, struct.pack("<IBB", dst, f, blocks))
+
+    def t3_poll_reply(self, data=b"", fmt="iso8"):
+        """The radio's answer to a short data poll (0-46 octets; none: refused), taken at the next start"""
+        f = T3_UDTF[fmt] if isinstance(fmt, str) else fmt
+        self.t3_op(T3_POLL_REPLY, struct.pack("<B", f) + bytes(data))
+
+    def t3_supl(self, data=b"", fmt="binary"):
+        """Supplementary user data offered with each call (0-46 octets; none: off), taken at the next start"""
+        f = T3_UDTF[fmt] if isinstance(fmt, str) else fmt
+        self.t3_op(T3_SUPL, struct.pack("<B", f) + bytes(data))
+
+    def t3_dial(self, digits=""):
+        """The digits ("0-9*#", 0-44; none: off) a call through a dialing gateway (PSTNI, PABXI, LINEI, DISPATI)
+        sends, taken at the next start"""
+        self.t3_op(T3_DIAL, digits.encode("ascii"))
+
+    def t3_site(self, site):
+        self.t3_op(T3_SITE, struct.pack("<H", site))
+
+    def t3_plan(self, base_hz, first=1, sep=0, tx_low=False, split_hz=0):
+        self.t3_op(T3_PLAN, struct.pack("<IHBBI", base_hz, first, sep, int(tx_low), split_hz))
+
+    def t3_status(self, dst, status, group=False):
+        """Send a status 0-126 to an MS or talkgroup, or poll an MS (127: its answer is t3.ax_info)"""
+        self.t3_op(T3_STATUS, struct.pack("<IBB", dst, int(group), status))
+
+    def t3_sdata(self, dst, data, group=False, fmt="iso8"):
+        """Send UDT short data (1-46 octets) to an MS or talkgroup; fmt a T3_UDTF name or number (UDT_Format)"""
+        f = T3_UDTF[fmt] if isinstance(fmt, str) else fmt
+        self.t3_op(T3_SDATA, struct.pack("<IBB", dst, int(group), f) + bytes(data))
+
+    def t3_load(self, n):
+        """Stage system n of the codeplug (docs/spec/dmr-trunking-codeplug.md) without starting it; BAD_ARG when it is absent
+        or has no control channel"""
+        self.t3_op(T3_LOAD, bytes([n]))
+
+    def cpkv_get(self, key):
+        """A key's value from the codeplug settings area (its first bytes for a long one), None when absent"""
+        out, total = b"", None
+        while total is None or len(out) < min(total, 128):
+            try:
+                r = self.request(CPKV, struct.pack("<BHH", CPKV_GET, key, len(out)))[1]
+            except DebugLinkError as e:
+                if e.status == 4:
+                    return None
+                raise
+            total = struct.unpack_from("<H", r)[0]
+            if len(r) <= 2:
+                break
+            out += r[2:]
+        return out
+
+    def cpkv_set(self, key, value):
+        """Set a key to value (bytes), in pieces a request holds: the first replaces, the rest patch"""
+        value = bytes(value)
+        step = 64 - 5
+        for off in range(0, max(len(value), 1), step):
+            self.request(CPKV, struct.pack("<BHH", CPKV_SET, key, off) + value[off:off + step])
+
+    def cpkv_remove(self, key):
+        self.request(CPKV, struct.pack("<BH", CPKV_REMOVE, key))
+
+    @staticmethod
+    def name_check(name):
+        """A channel's name check (docs/spec/channel-modes.md 3): FNV-1a 32 of the 16-byte NUL-padded name, folded"""
+        h = 0x811C9DC5
+        for b in name.encode("latin-1")[:16].ljust(16, b"\0"):
+            h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+        return (h ^ (h >> 16)) & 0xFFFF
+
+    @staticmethod
+    def system_record(systype, name, block, identity_len=0, flags=SYS_TX, sharing=0, own_id=0, fb_chan=0, fb_name=""):
+        """A codeplug system record (docs/spec/channel-modes.md 7.1), key CPKV_SYSTEM + n: the header, then the type's
+        block (its first identity_len octets the identity). flags: SYS_TX (without it the radio only listens there),
+        SYS_NEEDS_KEY; fb_chan the fallback channel number (0 none) and fb_name its name, for the check"""
+        check = DebugLink.name_check(fb_name) if fb_chan else 0
+        return (struct.pack("<BBBBIHH", systype, flags, sharing, identity_len, own_id, fb_chan, check) +
+                name.encode("latin-1")[:16].ljust(16, b"\0") + bytes(block))
+
+    @staticmethod
+    def tag_record(kind, system, name, flags=TAG_TX, fb_chan=None, fb_name="", params=b""):
+        """A channel's tag (docs/spec/channel-modes.md 3), key CPKV_CH_TAG + channel - 1: its kind and system, the
+        channel's own name (for the check), the flags (TAG_TX: without it the channel is receive only; TAG_BASE_OWN:
+        the channel record stands as it is) and, when fb_chan is given, a fallback channel of its own (0: none)"""
+        head = struct.pack("<BBHB", kind, system, DebugLink.name_check(name),
+                           flags | (TAG_FALLBACK if fb_chan is not None else 0))
+        if fb_chan is not None:
+            head += struct.pack("<HH", fb_chan, DebugLink.name_check(fb_name) if fb_chan else 0)
+        return head + bytes(params)
+
+    @staticmethod
+    def t3_system_record(name, model, net, par="a", cc=1, opts=0x20, own_id=0, sharing=0, fb_hold_s=0, fb_chan=0,
+                         fb_name="", plan=None, plan_flags=0, leave_dbm=0, ps_rq=0, sites=(), tx=True,
+                         needs_key=False):
+        """A Tier III system record (docs/spec/dmr-trunking-codeplug.md 1); plan: (base Hz, first LCN, separation
+        code, split Hz) or None; plan_flags bit 0 MS TX low, bit 1 don't learn channels; tx False: listen only;
+        needs_key: unusable without its key (CPKV_SYS_KEY + n)"""
+        base, first, sep, split = plan or (0, 0, 0, 0)
+        sites = list(sites)[:8]
+        block = (struct.pack("<BHBBHBIHBBIbBB", model, net, T3_PAR.get(par, par), cc, opts, fb_hold_s, base, first, sep,
+                             plan_flags, split, leave_dbm, ps_rq, len(sites)) + struct.pack(f"<{len(sites)}H", *sites))
+        return DebugLink.system_record(SYSTYPE_DMR_TRUNK, name, block, identity_len=4,
+                                       flags=(SYS_TX if tx else 0) | (SYS_NEEDS_KEY if needs_key else 0),
+                                       sharing=sharing, own_id=own_id, fb_chan=fb_chan, fb_name=fb_name)
+
+    @staticmethod
+    def t3_tag_record(system, name, tx=True, base_own=False, no_fallback=False, fb_chan=None, fb_name=""):
+        """A trunked channel's tag (docs/spec/dmr-trunking-codeplug.md 4). The channel record under it is a DMR
+        receive-only one, or any channel with base_own"""
+        flags = (TAG_TX if tx else 0) | (TAG_BASE_OWN if base_own else 0) | (T3_TAG_NO_FALLBACK if no_fallback else 0)
+        return DebugLink.tag_record(KIND_DMR_TRUNK, system, name, flags, fb_chan, fb_name)
+
+    @staticmethod
+    def t3_chan_record(system, lcn, rx_hz, tx_hz, ctrl=False, cc=0xFF):
+        """A Tier III system's channel (docs/spec/dmr-trunking-codeplug.md 2): a system entry, key CPKV_SYS_CHAN + any
+        free number; the entries are read in key order"""
+        return struct.pack("<BBBBHIIB", system, 0, 0xFF, 1 if ctrl else 0, lcn, rx_hz, tx_hz, cc)
+
+    def t3(self, cmd):
+        """start | stop | dereg | end"""
+        self.t3_op({"start": T3_START, "stop": T3_STOP, "dereg": T3_DEREG, "end": T3_END}[cmd])
+
+    def chip_reg(self, chip, reg, value=None, page=0):
+        """An RF chip register (the board's chip and page numbering): writes value when given, returns the read-back"""
+        req = struct.pack("<BBB", chip, page, reg) + (b"" if value is None else struct.pack("<I", value))
+        return struct.unpack_from("<I", self.request(CHIP_REG, req)[1])[0]
+
+    def soc_reg(self, addr, value=None):
+        """A 32-bit SoC register inside the platform's register windows: writes value when given, returns the read-back
+        (a read has the register's side effects)"""
+        req = struct.pack("<BI", CHIP_SOC, addr) + (b"" if value is None else struct.pack("<I", value))
+        return struct.unpack_from("<I", self.request(CHIP_REG, req)[1])[0]
+
+    def version(self):
+        return parse_kv(self.request(VERSION)[1].decode("ascii", "replace"))
+
+    def diag(self):
+        """(firmware ms, [lines])"""
+        lines, first, ms = [], 0, None
+        while True:
+            _, r = self.request(GET_DIAG, bytes([first]))
+            t, nxt = struct.unpack_from("<IB", r)
+            ms = t if ms is None else ms
+            text = r[5:].decode("ascii", "replace")
+            lines += text.split("\n")[:-1] if text else []
+            if nxt == 0xFF or nxt <= first:
+                return ms, lines
+            first = nxt
+
+    def reset(self):
+        """Zero the counters; returns the firmware ms at the reset."""
+        return struct.unpack_from("<I", self.request(RESET_COUNTERS)[1])[0]
+
+    def view_section(self, section):
+        """(firmware ms, next section, dict)"""
+        idx = VIEW_SECTIONS.index(section) if isinstance(section, str) else section
+        _, r = self.request(GET_VIEW, bytes([idx]))
+        ms, nxt = struct.unpack_from("<IB", r)
+        return ms, nxt, parse_kv(r[5:].decode("ascii", "replace"))
+
+    def view(self, sections=None):
+        """All sections (or the named ones) merged into one dict; 'section' keys dropped, 'ms' added."""
+        out = {}
+        if sections is None:
+            # Every section the firmware has, by its next links (an older firmware has fewer than VIEW_SECTIONS)
+            i = 0
+            while i != 0xFF and i < 64:
+                ms, i, kv = self.view_section(i)
+                kv.pop("section", None)
+                out.update(kv)
+                out.setdefault("ms", ms)
+            return out
+        for i in [VIEW_SECTIONS.index(s) for s in sections]:
+            ms, _, kv = self.view_section(i)
+            kv.pop("section", None)
+            out.update(kv)
+            out.setdefault("ms", ms)
+        return out
+
+    def screenshot_raw(self):
+        """(info dict, bytes) of one pass over the frame buffer (may tear, see the spec)"""
+        _, r = self.request(SCREENSHOT)
+        w, h, bpp, fmt, it, ib, il, ir, total, _ = struct.unpack_from("<HHBBBBBBII", r)
+        info = {"width": w, "height": h, "bpp": bpp, "format": fmt, "insets": (it, ib, il, ir), "total": total}
+        data = bytearray()
+        while len(data) < total:
+            _, r = self.request(SCREENSHOT, struct.pack("<IH", len(data), 1000))
+            off = struct.unpack_from("<I", r, 14)[0]     # r: the payload after the status byte
+            if off != len(data):
+                raise DebugLinkError(f"screenshot chunk at {off}, expected {len(data)}")
+            chunk = r[18:]
+            if not chunk:
+                raise DebugLinkError("screenshot: empty chunk")
+            data += chunk
+        return info, bytes(data)
+
+    def screenshot_packed(self):
+        """(info, frame buffer at the panel's depth or None, whole) of one pass in the packed form (debuglink.md 3.3):
+        LZ4, a tenth of the RGB565 form's bytes or less. whole: no frame was being drawn during the pass, so the
+        chunks are one frame. DebugLinkError with status ST_BAD_ARG from firmware without the packed form,
+        ST_UNAVAILABLE from a frame buffer too large for it."""
+        stream = bytearray()
+        first = last = None
+        while first is None or len(stream) < first["stream"]:
+            try:
+                _, r = self.request(SCREENSHOT, struct.pack("<IB", len(stream), SHOT_LZ4))
+            except DebugLinkError as e:
+                if first is None or e.status != ST_BAD_ARG:
+                    raise
+                return first, None, False       # a new frame's stream ends before this offset
+            self.packed_shots = True
+            w, h, bpp, fmt, it, ib, il, ir, total, off, size, frame, drawing = struct.unpack_from("<HHBBBBBBIIIIB", r)
+            if off != len(stream):
+                raise DebugLinkError(f"screenshot chunk at {off}, expected {len(stream)}")
+            last = {"width": w, "height": h, "bpp": bpp, "insets": (it, ib, il, ir), "size": size, "stream": total,
+                    "frame": frame, "drawing": bool(drawing)}
+            hdr = SHOT_HDR - 1 + (32 if bpp == 4 else 0)       # r: the payload after the status byte
+            if first is None:
+                first = dict(last, palette=struct.unpack_from("<16H", r, SHOT_HDR - 1) if bpp == 4 else None)
+            elif (total, frame) != (first["stream"], first["frame"]):
+                return first, None, False       # a frame was drawn since the first chunk: the stream changed
+            if len(r) <= hdr:
+                raise DebugLinkError("screenshot: empty chunk")
+            stream += r[hdr:]
+        try:
+            fb = lz4_block(bytes(stream), first["size"])
+        except (ValueError, IndexError):
+            return first, None, False           # chunks of a frame being drawn
+        return first, fb, not first["drawing"] and not last["drawing"]
+
+    def screenshot(self, tries=4):
+        """(info, bytes, stable) in the form to_rgb takes (RGB565, or 1 bpp rows). The packed form when the firmware
+        has it, read until one pass is whole; else the RGB565 form, read until two passes agree. stable False if
+        none did."""
+        if self.packed_shots is not False:
+            try:
+                got = None
+                for _ in range(max(1, tries)):
+                    info, fb, whole = self.screenshot_packed()
+                    if fb is not None:
+                        got = unpack_frame(info, fb)
+                        if whole:
+                            return got[0], got[1], True
+                if got is None:
+                    raise DebugLinkError(f"screenshot: the screen kept changing over {tries} reads")
+                return got[0], got[1], False
+            except DebugLinkError as e:
+                if e.status not in (ST_BAD_ARG, ST_UNAVAILABLE) or self.packed_shots:
+                    raise
+                self.packed_shots = False       # firmware before the packed form, or a frame buffer over 64 KB
+        info, prev = self.screenshot_raw()
+        for _ in range(max(1, tries) - 1):
+            info, cur = self.screenshot_raw()
+            if cur == prev:
+                return info, cur, True
+            prev = cur
+        return info, prev, tries <= 1
+
+    def key(self, name, gesture=PRESS, value=0):
+        a = ACTIONS[name] if isinstance(name, str) else name
+        self.request(KEY, struct.pack("<BBBb", 0, a, gesture, value))
+
+    def key_hold(self, name, ms):
+        a = ACTIONS[name] if isinstance(name, str) else name
+        self.request(KEY, struct.pack("<BBH", 3, a, int(ms)))
+
+    def keys_mask(self, mask, ms):
+        self.request(KEY, struct.pack("<BIH", 1, mask, int(ms)))
+
+    def wake(self):
+        self.request(KEY, bytes([2]))
+
+    def wait_keys_idle(self, timeout=12.0):
+        """Wait until no injected key is held (link section input.injected == 0)."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if as_int(self.view(["link"]).get("input.injected"), 0) == 0:
+                return
+            time.sleep(0.05)
+        raise DebugLinkError("injected keys still held")
+
+    def ptt(self, down, max_ms=10000):
+        _, r = self.request(PTT, struct.pack("<BH", 1 if down else 0, int(max_ms)))
+        return struct.unpack_from("<H", r)[0]
+
+    def ptt_for(self, seconds):
+        """Key PTT for seconds (<= 10), then release. The firmware's time-out is set just past the hold, so a lost
+        host can't leave it keyed; the release is sent in any case."""
+        if seconds <= 0 or seconds > INJECT_MAX_S:
+            raise DebugLinkError(f"PTT hold {seconds} s refused: 0 < S <= {INJECT_MAX_S:g}")
+        timeout_ms = min(int(seconds * 1000) + 300, 10000)
+        try:
+            self.ptt(True, timeout_ms)
+            time.sleep(seconds)
+        finally:
+            self.ptt(False)
+
+    def log(self):
+        """(dropped lines, text) of everything in the ring"""
+        text, dropped = "", 0
+        while True:
+            _, r = self.request(GET_LOG)
+            d, more = struct.unpack_from("<IB", r)
+            dropped += d
+            text += r[5:].decode("ascii", "replace")
+            if not more:
+                return dropped, text
+
+    def radio(self, op, args=b""):
+        self.request(RADIO, bytes([op]) + bytes(args))
+
+    # radio request helpers
+    def channel_step(self, d):
+        self.radio(OP_CHANNEL_STEP, struct.pack("<b", d))
+
+    def zone_pos(self, pos):
+        self.radio(OP_ZONE_POS, struct.pack("<H", pos))
+
+    def zone(self, index):
+        self.radio(OP_ZONE, struct.pack("<H", index))
+
+    def vfo(self, on):
+        self.radio(OP_VFO, bytes([1 if on else 0]))
+
+    def vfo_set(self, hz):
+        self.radio(OP_VFO_SET, struct.pack("<I", int(hz)))
+
+    def vfo_step(self, d):
+        self.radio(OP_VFO_STEP, struct.pack("<b", d))
+
+    def power_step(self, d):
+        """Step the power level by d. The radio wraps (lowest - 1 = highest), as its power key does: use power_level
+        to reach a level."""
+        self.radio(OP_POWER, struct.pack("<b", d))
+
+    def power_level(self, target):
+        """Put the power level at target (0 = lowest), never through a wrap: one step of the exact difference, then
+        checked. target may be "lowest", "highest", a level number or a step "+N" / "-N"; a step past either end is
+        refused (DebugLinkError), not wrapped. Returns the view's (power, power_name) after it."""
+        core = self.view(["core"])
+        cur, n = int(core["power"]), int(core["power_count"])
+        if n == 0:
+            raise DebugLinkError("radio power: this radio has no power levels")
+        t = str(target)
+        lvl = 0 if t == "lowest" else n - 1 if t == "highest" else cur + int(t) if t[:1] in "+-" else int(t)
+        if not 0 <= lvl < n:
+            raise DebugLinkError(f"radio power {t}: level {lvl} is outside 0..{n - 1} (now {cur}, "
+                                 f"{core.get('power_name')}); refusing, the radio would wrap")
+        if lvl != cur:
+            self.power_step(lvl - cur)
+        for _ in range(20):
+            core = self.view(["core"])
+            if int(core["power"]) == lvl:
+                return lvl, core.get("power_name")
+            time.sleep(0.05)
+        raise DebugLinkError(f"radio power {t}: the radio is at level {core['power']}, not {lvl}")
+
+    def squelch_step(self, d):
+        self.radio(OP_SQUELCH, struct.pack("<b", d))
+
+    def bandwidth(self, wide):
+        self.radio(OP_BANDWIDTH, bytes([1 if wide else 0]))
+
+    def tone(self, which, kind, value):
+        self.radio(OP_TONE, struct.pack("<BBH", which, TONE_TYPES[kind] if isinstance(kind, str) else kind, value))
+
+    def monitor(self, on):
+        self.radio(OP_MONITOR, bytes([1 if on else 0]))
+
+    def clear_temporary(self):
+        self.radio(OP_CLEAR_TEMP)
+
+    def reply_cancel(self):
+        self.radio(OP_REPLY_CANCEL)
+
+    def hotspot_exit(self):
+        self.radio(OP_HOTSPOT_EXIT)
+
+    def dmr_target(self, dmr_id, private=False):
+        """Talk to a typed ID / talkgroup until the channel changes."""
+        self.radio(OP_DMR_TARGET, struct.pack("<I", (int(dmr_id) & 0xFFFFFF) | (1 << 24 if private else 0)))
+
+    def dmr_contact(self, index):
+        self.radio(OP_DMR_CONTACT, struct.pack("<H", index))
+
+    def dmr_call_back(self):
+        self.radio(OP_DMR_CALL_BACK)
+
+    def dmr_target_clear(self):
+        self.radio(OP_DMR_TARGET_CLEAR)
+
+    def dmr_privacy(self, kind, key=0):
+        """Load a basic privacy key in RAM: kind off | moto (key 1-255) | anytone (key 0-65535)."""
+        self.radio(OP_DMR_PRIVACY, struct.pack("<BH", PRIVACY_TYPES[kind] if isinstance(kind, str) else kind, key))
+
+    def usb_network(self, on):
+        """Switch the USB personality after the reply: network adapter (CDC-NCM) or serial port. The radio
+        re-enumerates; in network mode the debug link answers over UDP (--port udp:<radio IP>)."""
+        self.radio(OP_USB_NETWORK, bytes([1 if on else 0]))
+
+    def ppp(self, on):
+        """Start PPP on the serial host port after the reply (CONFIG_NET_PPP builds; docs/spec/ppp.md), or end it
+        (LCP Terminate). Starting it isn't needed with pppd: its first LCP frame starts PPP too. Once IPCP is up the
+        debug link answers over UDP (--port udp:<radio IP>), as in USB network mode."""
+        self.radio(OP_PPP, bytes([1 if on else 0]))
+
+    def usb_net_settings(self, boot_network=False, passthrough=False, fixed_link=False, link_ip="0.0.0.0"):
+        """Store the USB network settings (docs/spec/usb-network.md 5): the network personality at power-on, control
+        station passthrough (the PC is the endpoint of the radio's own IP data), the fixed link pair (link_ip: the
+        radio's address, "0.0.0.0" = 192.168.10.1; the PC is the next address)."""
+        ip = struct.unpack(">I", bytes(int(x) for x in link_ip.split(".")))[0]
+        flags = (1 if boot_network else 0) | (2 if passthrough else 0) | (4 if fixed_link else 0)
+        self.radio(OP_USB_NET_SETTINGS, struct.pack("<BI", flags, ip))
+
+    def scan(self, cmd, pos=None):
+        """Scan: stop | zone | vfo | dual (pos = the second channel) | cancel | nuisance | toggle | select (pos = 0 A,
+        1 B: the dual watch channel that position, zone and VFO requests then change)."""
+        c = SCAN_CMDS[cmd] if isinstance(cmd, str) else cmd
+        if c == SCAN_CMDS["dual"]:
+            self.radio(OP_SCAN, bytes([c]) + struct.pack("<H", pos))
+        elif c == SCAN_CMDS["select"]:
+            self.radio(OP_SCAN, bytes([c, pos]))
+        else:
+            self.radio(OP_SCAN, bytes([c]))
+
+    def scan_vfo(self, lo_hz, hi_hz):
+        """Band scan of the VFO from lo to hi in its step."""
+        self.radio(OP_SCAN_VFO, struct.pack("<II", int(lo_hz), int(hi_hz)))
+
+    def beep(self, which, delay_s=0):
+        """A beep by name (BEEPS, or "sweep" for the speaker test), delay_s (0-255) seconds from now: on a radio whose
+        cable mutes the speaker, time to take the cable out first."""
+        b = SWEEP if which == "sweep" else BEEPS[which] if isinstance(which, str) else which
+        if not 0 <= delay_s <= 255:
+            raise DebugLinkError(f"beep delay {delay_s} s: 0-255")
+        self.radio(OP_BEEP, bytes([b, delay_s]) if delay_s else bytes([b]))
+
+    def vibrate(self, which):
+        """A vibration pattern on the board's motor (CONFIG_VIBRATE): message | call | emergency."""
+        self.radio(OP_VIBRATE, bytes([VIBES[which] if isinstance(which, str) else which]))
+
+    def volume(self, step):
+        """The speaker volume: a step 0 (mute) .. volume.max, or "knob" to give a knob radio's knob back (a radio with
+        no knob goes back to its default step). Raises DebugLinkError "unavailable" on a radio whose MCU can't set it."""
+        self.radio(OP_VOLUME, bytes([VOLUME_KNOB if step == "knob" else int(step)]))
+
+    def dmr_fields(self, mode=None, cc=None, ts=None):
+        """Mode ("fm" / "dmr" / "p25" / "nxdn" / "ysf"), color code 0..15 and timeslot 1 / 2, each None to keep it. On a channel these
+        are temporary changes, in the VFO the VFO's own settings (RADIO op 31). A mode the build lacks raises
+        DebugLinkError "unavailable"."""
+        m = 0xFF if mode is None else CHANNEL_MODES[mode]
+        self.radio(OP_DMR_FIELDS, bytes([m, 0xFF if cc is None else int(cc), 0 if ts is None else int(ts)]))
+
+    def p25_settings(self, rx_nac=0x293, tx_nac=0x293, rx_tgid=0, talkaround="auto", unit_call=False, tx_dst=1,
+                     unit_id=0):
+        """The P25 settings (RADIO op 42; debuglink.md 3.8; RAM only, the p25 view section shows them): the NAC
+        received (0xF7E: any) and sent, rx_tgid 0 every call of the NAC or only this talk group and calls to us,
+        talkaround auto|on|off (or 0..2), PTT calls the unit tx_dst (unit_call) or the talk group tx_dst, our unit ID
+        (0: the radio's DMR ID). The engine takes them when it isn't transmitting."""
+        ta = P25_TALKAROUND[talkaround] if isinstance(talkaround, str) else int(talkaround)
+        if not (0 <= rx_nac <= 0xFFF and 0 <= tx_nac <= 0xFFF and 0 <= rx_tgid <= 0xFFFF and 0 <= ta <= 2 and
+                0 <= unit_id <= 0xFFFFFF and 0 <= tx_dst <= (0xFFFFFF if unit_call else 0xFFFF)):
+            raise ValueError("p25_settings: NACs 0..0xFFF, rx_tgid 0..65535, talkaround auto|on|off, unit_id and "
+                             "a unit tx_dst 24 bits, a talk group tx_dst 16 bits")
+        self.radio(OP_P25, struct.pack("<HHHBBII", rx_nac, tx_nac, rx_tgid, ta, 1 if unit_call else 0, tx_dst,
+                                       unit_id))
+
+    def p25_settings_update(self, **kw):
+        """p25_settings with the settings in force (the p25 view section) changed only where kw says."""
+        v = self.view(["p25"])
+        if v.get("p25.built") != "1":
+            raise DebugLinkError("unavailable")
+        cur = {"rx_nac": int(v["p25.rx_nac"]), "tx_nac": int(v["p25.tx_nac"]), "rx_tgid": int(v["p25.rx_tgid"]),
+               "talkaround": int(v["p25.talkaround"]), "unit_call": v["p25.unit_call"] == "1",
+               "tx_dst": int(v["p25.tx_dst"]), "unit_id": int(v["p25.unit_id"])}
+        cur.update(kw)
+        self.p25_settings(**cur)
+
+    def nxdn_settings(self, rate9600=True, rx_ran=0, tx_ran=1, rx_gid=0, unit_call=False, tx_dst=1, unit_id=1,
+                      emergency=False):
+        """The NXDN settings (RADIO op 43; debuglink.md 3.8; RAM only, the nxdn view section shows them): 9600 or
+        4800 bit/s, the RAN received (0: any) and sent (0..63), rx_gid 0 every call of the RAN or only this group and
+        calls to us, PTT calls the unit tx_dst (unit_call) or the group tx_dst, our unit ID 1..65519, emergency calls.
+        The engine takes them when it isn't transmitting; a new rate starts it over."""
+        if not (0 <= rx_ran <= 63 and 0 <= tx_ran <= 63 and 0 <= rx_gid <= 0xFFFF and 1 <= unit_id <= 65519 and
+                0 <= tx_dst <= 0xFFFF):
+            raise ValueError("nxdn_settings: RANs 0..63, rx_gid and tx_dst 0..65535, unit_id 1..65519")
+        flags = (1 if rate9600 else 0) | (2 if unit_call else 0) | (4 if emergency else 0)
+        self.radio(OP_NXDN, struct.pack("<BBBHHH", flags, rx_ran, tx_ran, rx_gid, unit_id, tx_dst))
+
+    def nxdn_settings_update(self, **kw):
+        """nxdn_settings with the settings in force (the nxdn view section) changed only where kw says."""
+        v = self.view(["nxdn"])
+        if v.get("nxdn.built") != "1":
+            raise DebugLinkError("unavailable")
+        cur = {"rate9600": v["nxdn.rate"] == "9600", "rx_ran": int(v["nxdn.rx_ran"]), "tx_ran": int(v["nxdn.tx_ran"]),
+               "rx_gid": int(v["nxdn.rx_gid"]), "unit_call": v["nxdn.unit_call"] == "1",
+               "tx_dst": int(v["nxdn.tx_dst"]), "unit_id": int(v["nxdn.unit_id"]),
+               "emergency": v["nxdn.tx_emergency"] == "1"}
+        cur.update(kw)
+        self.nxdn_settings(**cur)
+
+    def ysf_settings(self, dt=0, narrow=False, rx_dgid=0, tx_dgid=0, src="", dest="ALL", down="", up=""):
+        """The YSF settings (RADIO op 44; debuglink.md 3.8; RAM only, the ysf view section shows them): the data type
+        (0 V/D-1, 1 Data FR, 2 DN, 3 VW) or a YSF_DATA_TYPES name, the deviation (narrow or wide), the DG-ID received
+        (0: any) and sent (0..127), and the call signs (at most 10 ASCII characters each): source, destination,
+        downlink, uplink. The engine takes them when it isn't transmitting; a new data type or deviation starts it
+        over."""
+        dt = YSF_DATA_TYPES[dt] if isinstance(dt, str) else int(dt)
+        if not (0 <= dt <= 3 and 0 <= rx_dgid <= 127 and 0 <= tx_dgid <= 127):
+            raise ValueError("ysf_settings: dt 0..3, DG-IDs 0..127")
+        def pack(s):
+            b = str(s).encode("ascii", "ignore")[:10]
+            return b + b" " * (10 - len(b))
+        self.radio(OP_YSF, struct.pack("<BBB", (1 if narrow else 0) | dt << 1, rx_dgid, tx_dgid) +
+                   pack(src) + pack(dest) + pack(down) + pack(up))
+
+    def ysf_settings_update(self, **kw):
+        """ysf_settings with the settings in force (the ysf view section) changed only where kw says."""
+        v = self.view(["ysf"])
+        if v.get("ysf.built") != "1":
+            raise DebugLinkError("unavailable")
+        cur = {"dt": int(v["ysf.dt_set"]), "narrow": v["ysf.narrow"] == "1", "rx_dgid": int(v["ysf.rx_dgid"]),
+               "tx_dgid": int(v["ysf.tx_dgid"]), "src": v["ysf.src_set"], "dest": v["ysf.dest_set"],
+               "down": v["ysf.down_set"], "up": v["ysf.up_set"]}
+        cur.update(kw)
+        self.ysf_settings(**cur)
+
+    def vfo_sfr(self, role, inbound_ts=1, framing=0, hang=0):
+        """The VFO's SFR role (RADIO op 38; sfr.md 4), saved with the VFO: role a SFR_ROLES name or 0..4, the inbound
+        slot 1 / 2, framing 0..3, hang 0..3: a codeplug channel's SFR byte A. The outbound color code is the VFO's own.
+        The radio core takes it in the VFO only (dmr.sfr_role shows it)."""
+        r = SFR_ROLES[role] if isinstance(role, str) else int(role)
+        if not 0 <= r <= 4 or inbound_ts not in (1, 2) or not 0 <= framing <= 3 or not 0 <= hang <= 3:
+            raise ValueError("vfo_sfr: role 0..4, inbound_ts 1|2, framing 0..3, hang 0..3")
+        a = r | framing << 3 | (0x20 if inbound_ts == 2 else 0) | hang << 6
+        self.vfo_sfr_byte(a)
+
+    def vfo_sfr_byte(self, a):
+        """The VFO's SFR role as byte A itself (RADIO op 38), as the view's ch.sfr shows it first."""
+        self.radio(OP_VFO_SFR, bytes([int(a) & 0xFF]))
+
+    def vfo_copy(self):
+        """Copy the channel on view to the VFO and open it (RADIO op 32). Raises DebugLinkError "refused" for a channel
+        the VFO can't hold (a mode this build lacks, a frequency outside the bands) and "unavailable" without a VFO or
+        in the VFO already."""
+        self.radio(OP_VFO_COPY)
+
+    def voice_test(self, on):
+        """The DMR voice test signal (RADIO op 33, RAM only): on, the encoder gets a generated tone that changes pitch
+        every 20 ms in place of the mic, so an over carries known, varying audio (the dmr view key voice.tx_test)."""
+        self.radio(OP_VOICE_TEST, bytes([1 if on else 0]))
+
+    def voice_capture(self, n=32):
+        """Capture the next n (up to 32) voice frames received, raw as on air (RADIO op 41, CONFIG_VOICE_CAPTURE
+        builds); 0 stops. voice_frames() reads them."""
+        self.radio(OP_VOICE_CAPTURE, bytes([n]))
+
+    def voice_frames(self):
+        """The frames captured: (want, [9-byte frame or None for a lost one, ...])"""
+        v = self.view(["voice_cap"])
+        if v.get("vcap.built") != "1":
+            raise DebugLinkError("unavailable: built without CONFIG_VOICE_CAPTURE")
+        text = v.get("vcap.frames", "")
+        frames = [None if f == "L" else bytes.fromhex(f) for f in text.split(",") if f]
+        return int(v.get("vcap.want", 0)), frames
+
+    def dtmf_key(self, digit, down):
+        """A DTMF key's down or up during FM TX (RADIO op 34; radio-features.md 3.7). Raises DebugLinkError "refused"
+        for a down while the radio core isn't ready (features view dtmf_ready=0: not FM TX with PTT held)."""
+        self.radio(OP_DTMF, bytes([ord(digit), 1 if down else 0]))
+
+    def dtmf(self, digits, ms=150, gap=100):
+        """Send DTMF digits as key taps: each held ms, then gap ms up. PTT must already be held on FM."""
+        for d in digits.upper():
+            self.dtmf_key(d, True)
+            time.sleep(ms / 1000.0)
+            self.dtmf_key(d, False)
+            time.sleep(gap / 1000.0)
+
+    def tx_limit(self, block=False, mhz=()):
+        """The test TX limit (RADIO op 35; radio-features.md 3.1), RAM only, a restart clears it: block refuses every
+        transmission; else the radio keys only on the frequencies in mhz (up to TX_LIMIT_MAX); neither: off. The core
+        view shows it (txlim, txlim.n, txlim.refused, txlim.last_hz). Raises DebugLinkError on firmware without it."""
+        hz = [round(float(f) * 1e6) for f in mhz]
+        if len(hz) > TX_LIMIT_MAX:
+            raise ValueError(f"tx_limit: at most {TX_LIMIT_MAX} frequencies")
+        self.radio(OP_TX_LIMIT, struct.pack(f"<BB{len(hz)}I", 1 if block else 0, len(hz), *hz))
+
+    def tx_drive(self, drive=0):
+        """The PA drive of the next transmission (RADIO op 36; power calibration), in the board's own units, in place of
+        its power level's; it lasts until that transmission ends. 0: the level's again. Set it before key-up. The core
+        view's tx_drive lists each level's drive. Raises DebugLinkError over the board's limit or without the hook."""
+        self.radio(OP_TX_DRIVE, struct.pack("<H", int(drive)))
+
+    def pa_keyup(self, dead_pm=None, knee_us=None, slope_us=None, window_us=None, settle_us=None, pa_us=None,
+                 ease_pm=0):
+        """The DMR PA key-up constants (RADIO op 37; docs/spec/pa-keyup.md), RAM only, from the next key-up: the dead
+        zone (1/1000 of the calibration's anchor drive), the knee and the slope (us), the window (the earliest start
+        before the first symbol), the boost's end before it (settle), the PA's point and the fastest approach (ease_pm,
+        1/1000 of the anchor over the dead zone; 0: no limit, and then not sent: an older firmware takes six). No arguments: the board's
+        again. The core view shows them (pa_keyup), the board's limits (pa_keyup.limits: the earliest point in us and
+        the highest drive) and the last key-up (pa_keyup.last: boost, drive, the boost's, PA's and drive's points in
+        us, then the top drive and the anchor it was planned against). Raises DebugLinkError out of range or on a
+        radio without it."""
+        v = (dead_pm, knee_us, slope_us, window_us, settle_us, pa_us)
+        if all(x is None for x in v):
+            self.radio(OP_PA_KEYUP, b"")
+            return
+        if any(x is None for x in v):
+            raise ValueError("pa_keyup: the six values, or none")
+        v = v + (ease_pm,) if ease_pm else v
+        self.radio(OP_PA_KEYUP, struct.pack(f"<{len(v)}H", *(int(x) for x in v)))
+
+    def pa_sweep(self, start, step, count, on_ms, off_ms, ceiling=100, mark_ms=0):
+        """One PA drive sweep (RADIO op 39; docs/spec/pa-keyup.md 7) on the FM carrier the radio transmits now: the drive
+        at 0 for off_ms, then start + i x step for on_ms, for count points, with the timing marker mark_ms after each
+        write and before each drop (0: none). The firmware caps the drive at ceiling % (at most 115) of the top level's
+        drive, the points over that drive and one sweep's length (1 s): returns (points run, the top level's drive).
+        Raises DebugLinkError when the radio isn't transmitting FM or has no sweep."""
+        args = struct.pack("<HhBBBBB", int(start), int(step), int(count), int(on_ms), int(off_ms), int(ceiling),
+                           int(mark_ms))
+        self.request(RADIO, bytes([OP_PA_SWEEP]) + args, timeout=self.timeout + 1.5)
+        n, top = self.view(["features"]).get("pa_sweep.last", "0/0/0").split("/")[:2]
+        return int(n), int(top)
+
+    def pa_keyrun(self, drives, key_ms, gap_ms, constants=None, reattach=False, restart=False):
+        """One PA key run (RADIO op 40; docs/spec/pa-keyup.md 7): the radio keys DMR on its channel once per drive, for
+        key_ms each with gap_ms between, by itself: the link is quiet until it is done, for a radio whose own RF upsets
+        its USB link. constants: the seven key-up constants set first (as pa_keyup), or None to keep the ones it has.
+        reattach: after the reply the radio's USB port leaves the bus and comes back (what a replug does), for a host
+        that gave up on the port while the radio transmitted; the link is then closed here, and the caller opens it
+        again and reads pa_keyrun.last itself. restart: the radio restarts after the reply instead (a USB controller
+        that only a restart brings back; RAM settings such as the constants and the test TX limit are lost, and so is
+        pa_keyrun.last). Returns the keys run (the view's pa_keyrun.last; None with reattach).
+        Raises DebugLinkError when it is refused or stops short."""
+        drives = [int(d) for d in drives]
+        if not drives or len(drives) > (PA_KEYRUN_MAX if constants is not None else 28):
+            raise ValueError(f"pa_keyrun: 1..{PA_KEYRUN_MAX} drives with the constants, 28 without")
+        flags = (1 if constants is not None else 0) | (2 if reattach else 0) | (4 if restart else 0)
+        args = struct.pack("<HHBB", int(key_ms), int(gap_ms), flags, len(drives))
+        if constants is not None:
+            c = [int(x) for x in constants] + [0] * (7 - len(constants))
+            args += struct.pack("<7H", *c[:7])
+        args += struct.pack(f"<{len(drives)}H", *drives)
+        run_s = len(drives) * (key_ms + gap_ms + 1000) / 1000.0
+        self.request(RADIO, bytes([OP_PA_KEYRUN]) + args, timeout=self.timeout + run_s)
+        if reattach or restart:
+            self.close()
+            return None
+        return int(self.view(["features"]).get("pa_keyrun.last", "0/0").split("/")[0])
+
+    def pa_sweep_grid(self, start, step, count, on_ms, off_ms, ceiling=100, mark_ms=0):
+        """A grid of any length as back-to-back sweeps on one key-up (keyed here, released at the end), about 0.2 s
+        apart: returns [(first drive, points run)] per sweep. Stops early where the firmware's limits end a sweep
+        short. The key-up is at most 10 s, which holds about 9 s of points."""
+        per = (on_ms + off_ms) / 1000.0
+        chunk = max(1, min(int(0.95 / per), 255))
+        sweeps = -(-count // chunk)
+        done, runs = 0, []
+        self.ptt(True, min(int((count * per + sweeps * 0.25) * 1000) + 1500, 10000))
+        try:
+            time.sleep(0.3)
+            while done < count:
+                n = min(chunk, count - done)
+                first = start + done * step
+                got, _ = self.pa_sweep(first, step, n, on_ms, off_ms, ceiling, mark_ms)
+                runs.append((first, got))
+                done += got
+                if got != n:
+                    break
+        finally:
+            self.ptt(False)
+        return runs
+
+    def tone_burst(self, on, max_ms=0):
+        """The 1750 Hz burst (FM): keys up and sends the tone while on. The firmware ends it by itself after max_ms
+        (0: inject_max_ms, the cap as for PTT), so a lost "off" can't leave the radio keyed."""
+        self.radio(OP_TONE_BURST, struct.pack("<BH", 1 if on else 0, max(0, min(int(max_ms), 0xFFFF))))  # firmware caps it
+
+    def setting(self, name, value):
+        """One radio setting (RADIO op 24, radio_set_settings): in effect at once and saved like the settings
+        screen's, except the few debuglink.md 3.8 marks RAM only. A SETTINGS name or id, value u16 (negative: two's
+        complement)."""
+        self.radio(OP_SETTING, struct.pack("<BH", SETTINGS[name] if isinstance(name, str) else name,
+                                           int(value) & 0xFFFF))
+
+    def roam(self, cmd):
+        """DMR roaming (docs/spec/dmr-roaming.md 6.1): zone_off | zone_on | zone_toggle | now | lock | unlock |
+        lock_toggle. The state is in the roam view section."""
+        self.radio(OP_ROAM, bytes([ROAM_CMDS[cmd] if isinstance(cmd, str) else cmd]))
+
+    # DMR data service (docs/spec/debuglink.md 3.12): requests go through the service's mailbox, so a busy answer
+    # means one of the kind is still queued (request() retries it for 2 s). Results: the dmr_data view section
+    def data_request(self, op, args=b""):
+        return self.request(DMR_DATA, bytes([op]) + bytes(args))[1]
+
+    def sms(self, dst, text, group=False, ack=True, fmt="tms"):
+        """Send a text message; fmt "tms" (Motorola TMS), "etsi" (ETSI defined short data), "etsi_ip" (ETSI IP text,
+        UDP 5016) or "default" (the radio's setting); text is Latin-1, at most SMS_TEXT_MAX characters here."""
+        t = text.encode("latin-1", "replace")[:SMS_TEXT_MAX]
+        f = {"tms": 0, "etsi": 4, "default": 8, "etsi_ip": 16}[fmt]
+        self.data_request(DATA_OP_SMS, struct.pack("<IB", int(dst) & 0xFFFFFF, (1 if group else 0) |
+                                                   (2 if ack else 0) | f) + t)
+
+    def call_alert(self, dst):
+        self.data_request(DATA_OP_CALL_ALERT, struct.pack("<I", int(dst) & 0xFFFFFF))
+
+    def radio_check(self, dst):
+        self.data_request(DATA_OP_RADIO_CHECK, struct.pack("<I", int(dst) & 0xFFFFFF))
+
+    def data_settings(self, ars_server=0, radio_check_reply=True, call_alert_ack=True, lrrp_reply=True,
+                      sms_etsi=False, radio_check_etsi=False, sms_format=None):
+        """The data service settings: ARS server ID (0 off), the answer switches, the ETSI forms. sms_format: the
+        default text message format, "etsi_ip" (the radio's default), "etsi" or "tms"; None: "etsi" when sms_etsi,
+        else "etsi_ip"."""
+        if sms_format is None:
+            sms_format = "etsi" if sms_etsi else "etsi_ip"
+        flags = (1 if radio_check_reply else 0) | (2 if call_alert_ack else 0) | (4 if lrrp_reply else 0) | \
+            {"tms": 0, "etsi": 8, "etsi_ip": 32}[sms_format] | (16 if radio_check_etsi else 0)
+        self.data_request(DATA_OP_SETTINGS, struct.pack("<IB", int(ars_server) & 0xFFFFFF, flags))
+
+    def inbox(self, index=0):
+        """Inbox message index (0 newest) as a dict, None when there is none."""
+        try:
+            r = self.data_request(DATA_OP_INBOX, bytes([index]))
+        except DebugLinkError as e:
+            if e.status == 4:
+                return None
+            raise
+        src, dst, group, flags = struct.unpack_from("<IIBB", r)
+        return {"src": src, "dst": dst, "group": bool(group), "unread": bool(flags & 1),
+                "format": "etsi_ip" if flags & 4 else "etsi" if flags & 2 else "tms", "text": r[10:].decode("latin-1")}
+
+    def mark_read(self, index=0):
+        self.data_request(DATA_OP_MARK_READ, bytes([index]))
+
+    def emergency(self, what="start"):
+        """The emergency key: "start", "cancel", or "dismiss" the alert heard (docs/spec/dmr-emergency.md)."""
+        self.data_request(DATA_OP_EMERGENCY, bytes([{"cancel": 0, "start": 1, "dismiss": 2}[what]]))
+
+    def emergency_settings(self, mode="alarm_call", dst=0, dst_private=False, etsi_fid=False, tone=True, tries=3,
+                           hot_mic_s=10):
+        """The emergency settings (saved by the radio): dst 0 = the channel's talk target."""
+        flags = (1 if dst_private else 0) | (2 if etsi_fid else 0) | (0 if tone else 4)
+        self.data_request(DATA_OP_EMERGENCY_SETTINGS, struct.pack("<BIBBB", EMERGENCY_MODES[mode],
+                                                                  int(dst) & 0xFFFFFF, flags, tries, hot_mic_s))
+
+    def ip_settings(self, compress="auto", confirmed="rules", tries=0, rules=(), gateway_id=None):
+        """IP packets over DMR (docs/spec/dmr-data.md 11, 12): compressed headers off / auto / all, confirmed delivery
+        off / rules / all, tries per confirmed packet (0 = the default), up to 2 rules: a radio ID (int) or
+        ("port", N). gateway_id: the DMR ID off-net unicast goes to (0 = dropped); None leaves it as it is.
+        State: the dmr_ip view section."""
+        r = [0, 0]
+        for i, x in enumerate(list(rules)[:2]):
+            r[i] = (IP_RULE_PORT | (int(x[1]) & 0xFFFF)) if isinstance(x, tuple) else (int(x) & 0xFFFFFF)
+        req = struct.pack("<BBBII", IP_COMPRESS[compress], IP_CONFIRMED[confirmed], int(tries), r[0], r[1])
+        if gateway_id is not None:
+            req += struct.pack("<I", int(gateway_id) & 0xFFFFFF)
+        self.data_request(DATA_OP_IP_SETTINGS, req)
+
+    def ip_send(self, dst, src_port, dst_port, payload, group=False, dst_ip=None):
+        """A UDP datagram into the IP gateway's air path, as if from the host on the USB network (needs
+        CONFIG_DMR_IP_GATEWAY). dst: the DMR ID it goes to; dst_ip: its IPv4 destination ("a.b.c.d" or an int) when
+        not the ID's own address (the off-net case). Payload at most IP_SEND_MAX bytes, 4 less with dst_ip."""
+        flags = (1 if group else 0) | (2 if dst_ip is not None else 0)
+        req = struct.pack("<IBHH", int(dst) & 0xFFFFFF, flags, int(src_port), int(dst_port))
+        if dst_ip is not None:
+            ip = dst_ip if isinstance(dst_ip, int) else int.from_bytes(socket.inet_aton(dst_ip), "big")
+            req += struct.pack("<I", ip & 0xFFFFFFFF)
+        self.data_request(DATA_OP_IP_SEND, req + bytes(payload)[:REQ_MAX - 1 - len(req)])
+
+    def tx_spacing(self, guard_ms, chain=True):
+        """The data service's spacing of our transmissions (docs/spec/dmr-data.md 12.6), RAM only: the guard after
+        our own transmission in ms, and whether unconfirmed IP packets to one destination share a transmission.
+        State: data.tx_guard_ms and data.tx_chain in the air view section."""
+        self.data_request(DATA_OP_TX_SPACING, struct.pack("<HB", int(guard_ms) & 0xFFFF, 1 if chain else 0))
+
+    def ip_confirmed_rate(self, rate="3/4"):
+        """The block rate of confirmed IP packets, "3/4" (the default), "1/2" or "1"; RAM only.
+        State: data.ip_cnf_rate in the air view section."""
+        self.data_request(DATA_OP_IP_CONFIRMED_RATE, bytes([("3/4", "1/2", "1").index(rate)]))
+
+    # APRS (docs/spec/debuglink.md 3.16, docs/spec/aprs.md 13). State: the aprs and aprs_set view sections
+    def aprs_request(self, op, args=b""):
+        return self.request(APRS, bytes([op]) + bytes(args))[1]
+
+    def aprs_send_now(self):
+        """A position beacon now (refused: no callsign, frequency or position)."""
+        self.aprs_request(APRS_OP_SEND_NOW)
+
+    def aprs_status(self, text):
+        self.aprs_request(APRS_OP_STATUS, text.encode("ascii", "replace")[:REQ_MAX - 2])
+
+    def aprs_message(self, to, text):
+        """A message with acks and retries (busy: one still waiting for its ack)."""
+        self.aprs_request(APRS_OP_MESSAGE, f"{to} {text}".encode("ascii", "replace")[:REQ_MAX - 2])
+
+    def aprs_test_call(self, call=""):
+        """A RAM-only callsign for bench tests ("" = back to the radio name)."""
+        self.aprs_request(APRS_OP_TEST_CALL, call.upper().encode("ascii")[:9])
+
+    def aprs_set(self, field, value):
+        """One APRS setting (saved): a name from APRS_FIELDS; lat / lon in degrees (float) or 1e-7 degree ints."""
+        if field in ("lat", "lon") and isinstance(value, float):
+            value = round(value * 1e7)
+        self.aprs_request(APRS_OP_SET, struct.pack("<BI", APRS_FIELDS[field] if isinstance(field, str) else field,
+                                                   int(value) & 0xFFFFFFFF))
+
+    # The SNMP agent (docs/spec/debuglink.md 3.17). State: the snmp view section
+    def snmp_request(self, op, args=b""):
+        return self.request(SNMP, bytes([op]) + bytes(args))[1]
+
+    def snmp_set(self, field, value):
+        """One agent setting (saved; trap_port RAM only): a name from SNMP_FIELDS."""
+        self.snmp_request(SNMP_OP_SET, struct.pack("<BI", SNMP_FIELDS[field] if isinstance(field, str) else field,
+                                                   value))
+
+    def snmp_community(self, write, text=""):
+        """The read (write=False) or write community; "" = the default (read "public", write none)."""
+        self.snmp_request(SNMP_OP_COMMUNITY, bytes([1 if write else 0]) + text.encode("latin-1")[:32])
+
+    def snmp_test_trap(self):
+        self.snmp_request(SNMP_OP_TEST_TRAP)
+
+    def aprs_nmea(self, sentence):
+        """An NMEA sentence as from the host ("$GPRMC,...*hh"); the checksum is added when missing."""
+        if "*" not in sentence:
+            body = sentence.lstrip("$")
+            c = 0
+            for ch in body.encode("ascii"):
+                c ^= ch
+            sentence = f"${body}*{c:02X}"
+        self.aprs_request(APRS_OP_NMEA, sentence.encode("ascii")[:REQ_MAX - 2])
+
+
+# ── pictures ────────────────────────────────────────────────────────────────
+
+def stubtool_module():
+    """stub/stubtool.py, for its LZ4 block codec (imported when first needed: it is large)"""
+    stub_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "stub")
+    if stub_dir not in sys.path:
+        sys.path.insert(0, stub_dir)
+    import stubtool
+    return stubtool
+
+
+def lz4_block(src, size):
+    """Decode an LZ4 block to exactly size bytes (stub/stubtool.py's decoder). ValueError if it is corrupt."""
+    stubtool = stubtool_module()
+    try:
+        return stubtool.lz4_block(src, size)
+    except stubtool.DumpError as e:
+        raise ValueError(str(e))
+
+
+def unpack_frame(info, fb):
+    """(info, bytes) in the RGB565 form's terms from a packed screenshot's frame buffer: a 16-color frame through its
+    palette, a 1 bpp or RGB565 frame as it is. info keeps the panel's depth as native_bpp."""
+    w, h, bpp = info["width"], info["height"], info["bpp"]
+    out = {"width": w, "height": h, "insets": info["insets"], "native_bpp": bpp, "packed": True}
+    if bpp == 4:
+        pal = [struct.pack("<H", c) for c in info["palette"]]
+        pair = [pal[b >> 4] + pal[b & 15] for b in range(256)]
+        stride = (w + 1) // 2
+        data = b"".join(b"".join(pair[b] for b in fb[y * stride:(y + 1) * stride])[:w * 2] for y in range(h))
+        bpp = 16
+    else:
+        data = fb
+    out.update(bpp=bpp, format=2 if bpp == 1 else 1, total=len(data))
+    return out, data
+
+
+def to_rgb(info, data, crop=False):
+    """(width, height, RGB888 rows as bytes) from the frame buffer"""
+    w, h = info["width"], info["height"]
+    rows = []
+    if info["format"] == 1:
+        for y in range(h):
+            row = bytearray()
+            for x in range(w):
+                o = (y * w + x) * 2
+                if o + 1 >= len(data):
+                    row += b"\0\0\0"
+                    continue
+                v = data[o] | (data[o + 1] << 8)
+                r, g, b = (v >> 11) & 0x1F, (v >> 5) & 0x3F, v & 0x1F
+                row += bytes(((r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)))
+            rows.append(bytes(row))
+    else:
+        stride = (w + 7) // 8
+        for y in range(h):
+            row = bytearray()
+            for x in range(w):
+                o = y * stride + x // 8
+                on = o < len(data) and data[o] & (0x80 >> (x & 7))
+                row += b"\0\0\0" if on else b"\xff\xff\xff"
+            rows.append(bytes(row))
+    if crop:
+        t, b, lft, rgt = info["insets"]
+        rows = [r[lft * 3:(w - rgt) * 3] for r in rows[t:h - b]]
+        w, h = w - lft - rgt, h - t - b
+    return w, h, rows
+
+
+def write_png(path, w, h, rows, scale=1):
+    """RGB888 rows to a PNG with only the standard library"""
+    if scale > 1:
+        big = []
+        for r in rows:
+            px = b"".join(r[i:i + 3] * scale for i in range(0, len(r), 3))
+            big += [px] * scale
+        rows, w, h = big, w * scale, h * scale
+    raw = b"".join(b"\0" + r for r in rows)
+
+    def chunk(kind, payload):
+        c = kind + payload
+        return struct.pack(">I", len(payload)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + \
+        chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+
+
+def parse_counters(lines):
+    """Counters from the diagnostics lines as a flat dict: 'k=v' tokens (prefixed by the line's first word, e.g.
+    call.rx, voice.play), the HR_C6000 boards' tokens (V H T I C D crc rc, as modem.voice etc.) and its audio line
+    (audio.blk, audio.ov, audio.dr) and BS outbound line (bs.slots, bs.cach, ...)."""
+    import re
+    out = {}
+    board = {"V": "modem.voice", "H": "modem.headers", "T": "modem.terminators", "I": "modem.idle",
+             "C": "modem.csbk", "D": "modem.data", "crc": "modem.crc", "rc": "modem.rc", "tk": "modem.ticks",
+             "si": "modem.sys_ints"}
+    for line in lines:
+        words = line.split()
+        if not words:
+            continue
+        if words[0] == "bs":            # "bs slN bN uN kN cN rfN stN" (and the HR_C7000's "bs tiN ttN ..."): the split
+                                        # duplex TX half's BS outbound
+            names = {"sl": "slots", "b": "bursts", "u": "underruns", "k": "keyups", "c": "cach", "rf": "rf_fail",
+                     "st": "stalls", "ti": "ts_ints", "tt": "ts_ticks", "ph": "phy_ints", "ri": "rftx_ints",
+                     "lt": "late", "mg": "max_gap_us"}
+            for w in words[1:]:
+                m = re.fullmatch(r"([a-z]+)(\d+)", w)
+                if m and m.group(1) in names:
+                    out[f"bs.{names[m.group(1)]}"] = int(m.group(2))
+            continue
+        if words[0] == "aud":           # "aud blk N ov N dr N": the HR_C6000 boards' DMR audio counters
+            for k, v in zip(words[1::2], words[2::2]):
+                if as_int(v) is not None:
+                    out[f"audio.{k}"] = as_int(v)
+            continue
+        if any("=" in w for w in words[1:]):
+            for w in words[1:]:
+                if "=" in w:
+                    k, v = w.split("=", 1)
+                    if as_int(v) is not None:
+                        out[f"{words[0]}.{k}"] = as_int(v)
+            continue
+        for w in words:
+            m = re.fullmatch(r"([A-Za-z]+)(\d+)", w)
+            if m and m.group(1) in board:
+                out.setdefault(board[m.group(1)], int(m.group(2)))
+    return out
+
+
+# ── command line ────────────────────────────────────────────────────────────
+
+def cmd_diag(link, a):
+    prev = None
+    while True:
+        ms, lines = link.diag()
+        if a.raw:
+            print("\n".join(lines))
+        else:
+            print(f"--- {link.port}  t={ms / 1000:.3f} s")
+            for ln in lines:
+                print("  " + ln)
+            cur = parse_counters(lines)
+            if prev is not None:
+                dt = (ms - prev[0]) / 1000 or 1e-9
+                rates = [f"{k} +{cur[k] - prev[1][k]} ({(cur[k] - prev[1][k]) / dt:.1f}/s)"
+                         for k in sorted(cur) if k in prev[1] and cur[k] != prev[1][k]]
+                if rates:
+                    print("  changed: " + ", ".join(rates))
+            prev = (ms, cur)
+        if not a.watch:
+            return 0
+        time.sleep(a.watch)
+
+
+def cmd_screenshot(link, a):
+    info, data, stable = link.screenshot(a.tries)
+    w, h, rows = to_rgb(info, data, a.crop)
+    write_png(a.output, w, h, rows, a.scale)
+    note = "" if stable else f" (the screen kept changing over {a.tries} reads: may be torn)"
+    print(f"{a.output}: {w}x{h} from {info['width']}x{info['height']}x{info.get('native_bpp', info['bpp'])}{note}")
+    return 0
+
+
+def cmd_key(link, a):
+    if a.mask is not None:
+        link.keys_mask(int(a.mask, 0), a.hold or 80)
+        return 0
+    if a.name is None:
+        raise DebugLinkError("give a key name or --mask")
+    name = a.name.lower()
+    if name not in ACTIONS:
+        raise DebugLinkError(f"unknown key {a.name!r}; one of: {' '.join(sorted(ACTIONS))}")
+    if name == "enc":
+        link.key(name, DOWN, a.steps or 1)
+    elif a.hold:
+        if a.hold > INJECT_MAX_S * 1000:
+            raise DebugLinkError("holds are limited to 10000 ms")
+        link.key_hold(name, a.hold)
+    elif a.down or a.up:
+        link.key(name, DOWN if a.down else UP)
+    elif a.long:
+        link.key(name, LONG)
+    elif a.repeat:
+        link.key(name, REPEAT, a.repeat)
+    elif name in ("ptt", "monitor"):
+        raise DebugLinkError(f"{name}: give --hold MS or --down / --up (or use the ptt command)")
+    else:
+        link.key(name, PRESS)
+    return 0
+
+
+def cmd_volume(link, a):
+    """volume [N|knob]: set, then print the volume.* lines of the features view (source, step, percent sent)."""
+    if a.value is not None:
+        try:
+            link.volume("knob" if a.value == "knob" else int(a.value, 0))
+        except DebugLinkError as e:
+            if e.status == 4:
+                print("volume: not supported on this radio (the knob works on the amplifier directly)", file=sys.stderr)
+                return 3
+            raise
+        time.sleep(0.3)         # the radio core applies it on its next poll
+    v = link.view(["features"])
+    for k in ("volume.src", "volume.step", "volume.max", "volume.override", "volume.sent", "volume.soft"):
+        if k in v:
+            print(f"{k}={v[k]}")
+    return 0
+
+
+def cmd_radio(link, a):
+    op, args = a.op, a.args
+
+    def num(i, f=int):
+        if len(args) <= i:
+            raise DebugLinkError(f"radio {op}: missing argument")
+        return f(args[i])
+    if op == "channel":
+        link.channel_step(num(0))
+    elif op == "pos":
+        link.zone_pos(num(0))
+    elif op == "zone":
+        link.zone(num(0))
+    elif op == "vfo":
+        link.vfo(args[:1] != ["off"])
+    elif op == "freq":
+        link.vfo_set(round(num(0, float) * 1e6))
+    elif op == "step":
+        link.vfo_step(num(0))
+    elif op == "power":               # power lowest|highest|LEVEL|+N|-N (never wraps)
+        lvl, name = link.power_level(num(0, str))
+        print(f"power={lvl} power_name={name}")
+    elif op == "squelch":
+        link.squelch_step(num(0))
+    elif op == "bw":
+        link.bandwidth(args[:1] == ["25"])
+    elif op == "tone":                # tone tx|rx|both none|ctcss|dcs|dcs_inv VALUE
+        which = {"tx": 1, "rx": 2, "both": 3}[args[0]]
+        link.tone(which, args[1], int(args[2]) if len(args) > 2 else 0)
+    elif op == "monitor":
+        link.monitor(args[:1] != ["off"])
+    elif op == "clear":
+        link.clear_temporary()
+    elif op == "reply-cancel":
+        link.reply_cancel()
+    elif op == "hotspot-exit":
+        link.hotspot_exit()
+    elif op == "target":              # target ID [private]
+        link.dmr_target(num(0), args[1:2] == ["private"])
+    elif op == "contact":
+        link.dmr_contact(num(0))
+    elif op == "call-back":
+        link.dmr_call_back()
+    elif op == "target-clear":
+        link.dmr_target_clear()
+    elif op == "privacy":             # privacy off | moto KEY | anytone KEY
+        link.dmr_privacy(args[0], int(args[1], 0) if len(args) > 1 else 0)
+    elif op == "scan":                # scan stop|zone|vfo|dual POS|cancel|nuisance|toggle|select a|b
+        if args[:1] == ["select"]:
+            if len(args) < 2 or args[1].lower() not in ("a", "b"):
+                raise SystemExit("scan select a|b")
+            link.scan("select", "ab".index(args[1].lower()))
+        else:
+            link.scan(args[0] if args else "toggle", num(1) if args[:1] == ["dual"] else None)
+    elif op == "scan-vfo":            # scan-vfo LO_MHZ HI_MHZ
+        link.scan_vfo(round(num(0, float) * 1e6), round(num(1, float) * 1e6))
+    elif op == "beep":                # beep key|error|tx_permit|...|sweep [DELAY_S]
+        link.beep(args[0] if args else "key", num(1) if len(args) > 1 else 0)
+    elif op == "vibrate":             # vibrate message|call|emergency
+        link.vibrate(args[0] if args else "message")
+    elif op == "copy-vfo":            # the channel's settings into the VFO, and open it
+        link.vfo_copy()
+    elif op == "mode":                # mode fm|dmr|p25|nxdn (the VFO's own in the VFO, else temporary)
+        if not args or args[0] not in CHANNEL_MODES:
+            raise SystemExit("mode " + "|".join(CHANNEL_MODES))
+        link.dmr_fields(mode=args[0])
+    elif op == "p25":                 # p25 [rx_nac=N] [tx_nac=N] [nac=N] [rx_tgid=N] [talkaround=auto|on|off] [tg=N|unit=N] [unit_id=N]
+        kw = {}
+        for a in args:
+            k, _, val = a.partition("=")
+            if k == "nac":
+                kw["rx_nac"] = kw["tx_nac"] = int(val, 0)
+            elif k in ("rx_nac", "tx_nac", "rx_tgid", "unit_id"):
+                kw[k] = int(val, 0)
+            elif k == "talkaround" and val in P25_TALKAROUND:
+                kw[k] = val
+            elif k in ("tg", "unit"):
+                kw["unit_call"] = k == "unit"
+                kw["tx_dst"] = int(val, 0)
+            else:
+                raise SystemExit("p25 [nac=N] [rx_nac=N] [tx_nac=N] [rx_tgid=N] [talkaround=auto|on|off] "
+                                 "[tg=N|unit=N] [unit_id=N]")
+        link.p25_settings_update(**kw)
+    elif op == "nxdn":                # nxdn [rate=9600|4800] [ran=N] [rx_ran=N] [tx_ran=N] [rx_gid=N] [tg=N|unit=N] [unit_id=N] [emergency=0|1]
+        kw = {}
+        usage = ("nxdn [rate=9600|4800] [ran=N] [rx_ran=N] [tx_ran=N] [rx_gid=N] [tg=N|unit=N] [unit_id=N] "
+                 "[emergency=0|1]")
+        for a in args:
+            k, _, val = a.partition("=")
+            if k == "rate" and val in ("9600", "4800"):
+                kw["rate9600"] = val == "9600"
+            elif k == "ran":
+                kw["rx_ran"] = kw["tx_ran"] = int(val, 0)
+            elif k in ("rx_ran", "tx_ran", "rx_gid", "unit_id"):
+                kw[k] = int(val, 0)
+            elif k in ("tg", "unit"):
+                kw["unit_call"] = k == "unit"
+                kw["tx_dst"] = int(val, 0)
+            elif k == "emergency" and val in ("0", "1"):
+                kw["emergency"] = val == "1"
+            else:
+                raise SystemExit(usage)
+        link.nxdn_settings_update(**kw)
+    elif op == "ysf":                 # ysf [dt=vd1|data|dn|vw] [dev=wide|narrow] [dgid=N] [rx_dgid=N] [tx_dgid=N] [src=CALL] [dest=CALL] [down=CALL] [up=CALL]
+        kw = {}
+        usage = ("ysf [dt=vd1|data|dn|vw] [dev=wide|narrow] [dgid=N] [rx_dgid=N] [tx_dgid=N] [src=CALL] "
+                 "[dest=CALL] [down=CALL] [up=CALL]")
+        for a in args:
+            k, _, val = a.partition("=")
+            if k == "dt" and val in YSF_DATA_TYPES:
+                kw["dt"] = YSF_DATA_TYPES[val]
+            elif k == "dev" and val in ("wide", "narrow"):
+                kw["narrow"] = val == "narrow"
+            elif k == "dgid":
+                kw["rx_dgid"] = kw["tx_dgid"] = int(val, 0)
+            elif k in ("rx_dgid", "tx_dgid"):
+                kw[k] = int(val, 0)
+            elif k in ("src", "dest", "down", "up"):
+                kw[k] = val
+            else:
+                raise SystemExit(usage)
+        link.ysf_settings_update(**kw)
+    elif op == "cc":                  # cc 0..15
+        link.dmr_fields(cc=num(0))
+    elif op == "ts":                  # ts 1|2
+        link.dmr_fields(ts=num(0))
+    elif op == "sfr":                 # sfr off|user|user-erdm|rpt|rpt-erdm [ts=1|2] [framing=0..3] [hang=0..3]
+        if not args or (args[0] not in SFR_ROLES and not (args[0].isdigit() and int(args[0]) in SFR_ROLES.values())):
+            raise SystemExit("sfr ROLE [ts=1|2] [framing=N] [hang=N]: ROLE " + "|".join(SFR_ROLES))
+        kw = dict(a.split("=", 1) for a in args[1:] if "=" in a)
+        link.vfo_sfr(args[0] if not args[0].isdigit() else int(args[0]), int(kw.get("ts", 1)),
+                     int(kw.get("framing", 0)), int(kw.get("hang", 0)))
+    elif op == "dtmf":                # dtmf DIGITS [ms]: key taps during FM TX (PTT held)
+        if not args or any(c not in DTMF_DIGITS for c in args[0].upper()):
+            raise SystemExit("dtmf DIGITS [ms]: digits from " + DTMF_DIGITS)
+        link.dtmf(args[0], num(1) if len(args) > 1 else 150)
+    elif op == "burst":               # burst on|off [max_ms]
+        link.tone_burst(args[:1] != ["off"], num(1) if len(args) > 1 else 0)
+    elif op == "voice-test":          # voice-test on|off (the DMR encoder's test signal, RAM only)
+        link.voice_test(args[:1] != ["off"])
+    elif op == "tx-limit":            # tx-limit off|block|MHZ[,MHZ...] (the test TX limit, RAM only)
+        if not args or args[0] in ("off", "block"):
+            link.tx_limit(block=args[:1] == ["block"])
+        else:
+            link.tx_limit(mhz=[float(f) for f in ",".join(args).split(",") if f])
+    elif op == "tx-drive":            # tx-drive N|off (the next transmission's PA drive, power calibration)
+        link.tx_drive(0 if args[:1] in ([], ["off"]) else num(0))
+    elif op == "pa-keyrun":           # pa-keyrun KEY_MS GAP_MS DRIVE... (keys DMR itself, the board's constants)
+        if len(args) < 3:
+            raise SystemExit("pa-keyrun KEY_MS GAP_MS DRIVE...")
+        print("keys run:", link.pa_keyrun([num(i) for i in range(2, len(args))], num(0), num(1)))
+    elif op == "pa-sweep":            # pa-sweep START STEP COUNT ON_MS OFF_MS [CEILING_PCT] [MARK_MS] (keys FM itself)
+        runs = link.pa_sweep_grid(*[num(i) for i in range(len(args))])
+        print("points", sum(n for _, n in runs), "sweeps", " ".join(f"{d}:{n}" for d, n in runs))
+    elif op == "pa-keyup":            # pa-keyup DEAD_PM KNEE_US SLOPE_US WINDOW_US SETTLE_US PA_US [EASE_PM]|default (RAM only)
+        link.pa_keyup(*([] if args[:1] in ([], ["default"]) else [num(i) for i in range(7 if len(args) > 6 else 6)]))
+    elif op == "set":                 # set NAME VALUE
+        link.setting(args[0], num(1))
+    elif op == "usb":                 # usb network|serial
+        link.usb_network(args[:1] == ["network"])
+    elif op == "ppp":                 # ppp on|off
+        link.ppp(args[:1] != ["off"])
+    elif op == "usb-settings":        # usb-settings [boot] [passthrough] [fixed[=IP]] (stored; none: all off)
+        fixed = [x for x in args if x.startswith("fixed")]
+        link.usb_net_settings("boot" in args, "passthrough" in args, bool(fixed),
+                              fixed[0].split("=", 1)[1] if fixed and "=" in fixed[0] else "0.0.0.0")
+    elif op == "roam":                # roam zone_on|zone_off|zone_toggle|now|lock|unlock|lock_toggle
+        link.roam(args[0] if args else "now")
+    else:
+        raise DebugLinkError(f"unknown radio op {op!r}")
+    return 0
+
+
+def cmd_aprs(link, a):
+    args = a.args
+    if a.op == "send":
+        link.aprs_send_now()
+    elif a.op == "status":
+        link.aprs_status(" ".join(args))
+    elif a.op == "msg":
+        if len(args) < 2:
+            print("aprs msg: CALL TEXT", file=sys.stderr)
+            return 2
+        link.aprs_message(args[0].upper(), " ".join(args[1:]))
+    elif a.op == "call":
+        link.aprs_test_call(args[0] if args else "")
+    elif a.op == "set":
+        if len(args) != 2 or args[0] not in APRS_FIELDS:
+            print(f"aprs set: FIELD VALUE, FIELD one of {', '.join(APRS_FIELDS)}", file=sys.stderr)
+            return 2
+        name, v = args
+        table = {"region": APRS_REGIONS, "pos_src": APRS_POS_SRCS, "via": APRS_VIAS}.get(name, {})
+        if v.lower() in table:
+            value = table[v.lower()]
+        elif name in ("lat", "lon"):
+            value = float(v)
+        elif name == "freq_hz" and "." in v:
+            value = round(float(v) * 1e6)       # MHz
+        else:
+            value = int(v, 0)
+        link.aprs_set(name, value)
+    elif a.op == "nmea":
+        link.aprs_nmea(" ".join(args))
+    return 0
+
+
+def cmd_snmp(link, a):
+    args = a.args
+    if a.op == "set":
+        if len(args) != 2 or args[0] not in SNMP_FIELDS:
+            print(f"snmp set: FIELD VALUE, FIELD one of {', '.join(SNMP_FIELDS)}", file=sys.stderr)
+            return 2
+        name, v = args
+        if name == "flags" and not v[0].isdigit():
+            value = 0
+            for f in filter(None, v.split(",")):
+                value |= SNMP_FLAGS[f]
+        else:
+            value = int(v, 0)
+        link.snmp_set(name, value)
+    elif a.op in ("read", "write"):
+        link.snmp_community(a.op == "write", args[0] if args else "")
+    elif a.op == "trap":
+        link.snmp_test_trap()
+    else:
+        v = link.view(["snmp"])
+        for k in sorted(v):
+            if k.startswith("snmp."):
+                print(f"{k}={v[k]}")
+    return 0
+
+
+def cmd_data(link, a):
+    args = a.args
+    if a.op == "sms":
+        if len(args) < 2:
+            print("data sms: ID TEXT", file=sys.stderr)
+            return 2
+        link.sms(int(args[0], 0), " ".join(args[1:]), group=a.group, ack=not a.no_ack, fmt=a.format)
+    elif a.op in ("alert", "check"):
+        if len(args) != 1:
+            print(f"data {a.op}: ID", file=sys.stderr)
+            return 2
+        (link.call_alert if a.op == "alert" else link.radio_check)(int(args[0], 0))
+    elif a.op == "settings":
+        if not args:
+            print("data settings: ARS_ID [check-reply] [no-alert-ack] [no-lrrp]", file=sys.stderr)
+            return 2
+        link.data_settings(int(args[0], 0), "check-reply" in args, "no-alert-ack" not in args, "no-lrrp" not in args,
+                           radio_check_etsi="check-etsi" in args,
+                           sms_format="tms" if "sms-tms" in args else "etsi" if "sms-etsi" in args else "etsi_ip")
+    elif a.op == "inbox":
+        m = link.inbox(int(args[0]) if args else 0)
+        print("empty" if m is None else f"from {m['src']} to {m['dst']}{' (group)' if m['group'] else ''}"
+              f"{' unread' if m['unread'] else ''} [{m['format']}]: {m['text']}")
+    elif a.op == "read":
+        link.mark_read(int(args[0]) if args else 0)
+    elif a.op == "emergency":
+        what = args[0] if args else "start"
+        if what not in ("start", "cancel", "dismiss"):
+            print("data emergency: start|cancel|dismiss", file=sys.stderr)
+            return 2
+        link.emergency(what)
+    elif a.op == "ip-settings":
+        if not args or args[0] not in IP_COMPRESS:
+            print("data ip-settings: off|auto|all [off|rules|all] [tries=N] [id=ID] [port=N] [gateway=ID] (two rules "
+                  "at most)", file=sys.stderr)
+            return 2
+        mode = next((x for x in args[1:] if x in IP_CONFIRMED), "rules")
+        kv = [x.split("=", 1) for x in args[1:] if "=" in x]
+        tries = next((int(v) for k, v in kv if k == "tries"), 0)
+        rules = [int(v, 0) if k == "id" else ("port", int(v, 0)) for k, v in kv if k in ("id", "port")]
+        gateway = next((int(v, 0) for k, v in kv if k == "gateway"), None)
+        link.ip_settings(args[0], mode, tries, rules, gateway_id=gateway)
+    elif a.op == "ip-send":
+        if len(args) < 3:
+            print("data ip-send: ID[@A.B.C.D] SRC_PORT DST_PORT [TEXT] [--group]", file=sys.stderr)
+            return 2
+        dst, _, dst_ip = args[0].partition("@")
+        link.ip_send(int(dst, 0), int(args[1], 0), int(args[2], 0), " ".join(args[3:]).encode(), group=a.group,
+                     dst_ip=dst_ip or None)
+    elif a.op == "tx-spacing":
+        if not args or not args[0].isdigit() or (args[1:] and args[1] not in ("chain", "no-chain")):
+            print("data tx-spacing: GUARD_MS [chain|no-chain]", file=sys.stderr)
+            return 2
+        link.tx_spacing(int(args[0]), args[1:2] != ["no-chain"])
+    elif a.op == "em-settings":
+        if not args or args[0] not in EMERGENCY_MODES:
+            print("data em-settings: alarm|alarm_call|call [DST] [private] [etsi] [no-tone] [tries=N] [hot=S]",
+                  file=sys.stderr)
+            return 2
+        kv = dict(x.split("=", 1) for x in args[1:] if "=" in x)
+        dst = next((int(x, 0) for x in args[1:] if x[:1].isdigit()), 0)
+        link.emergency_settings(args[0], dst, "private" in args, "etsi" in args, "no-tone" not in args,
+                                int(kv.get("tries", 3)), int(kv.get("hot", 10)))
+    return 0
+
+
+CHIP_STM32F4, CHIP_HRC7000 = 0, 1   # INFO_CHIP's family byte (debuglink.md 3.9)
+
+
+def decode_chip(r):
+    idcode, flash_kb, u0, u1, u2, optcr, rdp, rdp_byte, wrp, bor, user = struct.unpack_from("<IH3IIBBHBB", r)
+    family = r[28] if len(r) > 28 else CHIP_STM32F4    # older firmware: the STM32F4 was the only one answering
+    return {"family": family, "idcode": idcode, "dev_id": idcode & 0xFFF, "rev_id": idcode >> 16, "flash_kb": flash_kb,
+            "uid": (u0, u1, u2), "token": u0, "optcr": optcr, "rdp": rdp, "rdp_byte": rdp_byte, "wrp": wrp,
+            "wrp_sectors": [i for i in range(12) if wrp & (1 << i)], "bor": bor, "user": user}
+
+
+def decode_iddb(r):
+    """IDDB's reply after the status (debuglink.md 3.23): format is the header's letter ('N', 'n', 'C'), '' for none"""
+    fmt, records, found = struct.unpack_from("<BIB", r)
+    return {"format": chr(fmt) if fmt else "", "records": records, "found": bool(found),
+            "text": r[6:].decode("ascii", "replace") if found else None}
+
+
+# READ_MEM's windows by chip family (debuglink.md 3.10): (start, end exclusive, aligned words only). The radio decides;
+# these only give a clear message first. Flash ends at the largest part's size: the radio knows its own
+MEM_WINDOWS = {
+    CHIP_STM32F4: [(0x08000000, 0x08100000, False), (0x1FFF0000, 0x1FFF7800, False), (0x1FFF7800, 0x1FFF7A10, False),
+                   (0x1FFFC000, 0x1FFFC010, False), (0xE000ED00, 0xE000ED40, True)],
+    CHIP_HRC7000: [(0x03000000, 0x03200000, False), (0x00010000, 0x00058000, False), (0x18000000, 0x18008000, False),
+                   (0x11000000, 0x11000060, True), (0x14020000, 0x14020080, True), (0x14100000, 0x14100080, True),
+                   (0x14110000, 0x14110080, True), (0x17000000, 0x17000034, True), (0x1700003C, 0x17000040, True),
+                   (0x17000044, 0x1700004C, True), (0x17000060, 0x17000090, True)],
+}
+
+
+def mem_allowed(addr, n, family=CHIP_STM32F4):
+    for lo, hi, words in MEM_WINDOWS.get(family, []):
+        if n > 0 and lo <= addr and addr + n <= hi:
+            return not words or (addr | n) % 4 == 0
+    return False
+
+
+def chip_family(link):
+    """INFO_CHIP's family, or None while the radio can't say (an HR_C7000 before its UID is read)"""
+    try:
+        return link.chip()["family"]
+    except DebugLinkError:
+        return None
+
+
+def mem_precheck(link, addr, n):
+    """An error message if the range is outside the radio's windows, else None"""
+    family = chip_family(link)
+    if family is None or family not in MEM_WINDOWS or mem_allowed(addr, n, family):
+        return None
+    return (f"0x{addr:08X}+0x{n:X} is outside the readable ranges (register blocks: whole aligned words only; "
+            "docs/spec/debuglink.md 3.10)")
+
+
+def git_toplevel(path):
+    """The git work tree holding path (or its nearest existing parent), None if none."""
+    import subprocess
+    d = os.path.abspath(path)
+    while not os.path.isdir(d):
+        d = os.path.dirname(d)
+    try:
+        r = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    except OSError:
+        return None
+    return os.path.realpath(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+
+
+def dump_path_ok(path):
+    """(ok, reason): refuse any path inside a git work tree (the vendor bootloader is proprietary: never commit)."""
+    top = git_toplevel(path)
+    if top is not None:
+        return False, f"{path} is inside the git work tree {top}; dumps must stay out of any repository"
+    return True, ""
+
+
+def print_chip(c):
+    if c["family"] != CHIP_STM32F4:
+        name = {CHIP_HRC7000: "HR_C7000"}.get(c["family"], f"family {c['family']}")
+        print(f"chip     {name} (no ID or option byte registers)")
+        print(f"uid      {c['uid'][2]:08X}{c['uid'][1]:08X}{c['uid'][0]:08X} (token 0x{c['token']:08X}; the data flash's unique ID)")
+        return
+    rdp_names = {0: "level 0 (0xAA, no protection)", 1: f"LEVEL 1 (0x{c['rdp_byte']:02X}: read protection)",
+                 2: "LEVEL 2 (0xCC: permanent, ROM bootloader and debug disabled)"}
+    idc = f"0x{c['idcode']:08X}"
+    if c["idcode"] == 0:
+        idc += " (reads 0 without a debugger on some STM32F40x revisions)"
+    else:
+        idc += f" (dev 0x{c['dev_id']:03X}{' STM32F405/407' if c['dev_id'] == 0x413 else ''}, rev 0x{c['rev_id']:04X})"
+    print(f"idcode   {idc}")
+    print(f"flash    {c['flash_kb']} KB")
+    print(f"uid      {c['uid'][2]:08X}{c['uid'][1]:08X}{c['uid'][0]:08X} (token 0x{c['token']:08X})")
+    print(f"optcr    0x{c['optcr']:08X}")
+    print(f"rdp      {rdp_names[c['rdp']]}")
+    print(f"wrp      {'sectors ' + ','.join(map(str, c['wrp_sectors'])) if c['wrp_sectors'] else 'none'}")
+    print(f"bor      level {['3 (2.7 V)', '2 (2.4 V)', '1 (2.1 V)', 'off'][c['bor']]}")
+    u = c["user"]
+    print(f"user     WDG_SW={u & 1} nRST_STOP={(u >> 1) & 1} nRST_STDBY={(u >> 2) & 1}")
+    if c["rdp"] == 1:
+        # the usual state of a radio as it ships: RadioFoundry's loaders don't need level 0, only the ROM bootloader does
+        print("note     RDP level 1 is normal for a stock radio. The ROM bootloader route (reboot --rom-dfu) stays "
+              "closed:\n         leaving level 1 mass-erases all flash, the stock bootloader too", file=sys.stderr)
+    elif c["rdp"] != 0:
+        print("\n*** WARNING: RDP level 2 is permanent: the ROM bootloader and the debug port are disabled for good. "
+              "Report this\n*** to the owner before doing anything else. ***", file=sys.stderr)
+    app_wrp = [s for s in c["wrp_sectors"] if s >= 3]
+    if app_wrp:
+        print(f"\n*** WARNING: application sectors {app_wrp} are write protected: no loader can rewrite them ***",
+              file=sys.stderr)
+
+
+def cmd_dump(link, a):
+    addr, n = int(a.addr, 0), int(a.len, 0)
+    why = mem_precheck(link, addr, n)
+    if why:
+        print(f"rfoundry_debug: {why}", file=sys.stderr)
+        return 2
+    out = a.output
+    ok, why = dump_path_ok(out)
+    if not ok:
+        print(f"rfoundry_debug: refusing: {why}", file=sys.stderr)
+        return 2
+    data = link.dump(addr, n, lambda d, t: print(f"\r{d}/{t} bytes", end="", file=sys.stderr))
+    print(file=sys.stderr)
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, "wb") as f:
+        f.write(data)
+    import hashlib
+    print(f"{out}: {len(data)} bytes from 0x{addr:08X}, sha256 {hashlib.sha256(data).hexdigest()}")
+    if addr < 0x0800C000 and addr >= 0x08000000:
+        print("note: this holds the proprietary stock bootloader: never commit or publish it")
+    return 0
+
+
+def format_peek(addr, data):
+    """Hex dump lines: little-endian words, four to a line, when addr and the length are word aligned; else bytes,
+    sixteen to a line"""
+    lines = []
+    if (addr | len(data)) % 4 == 0:
+        for i in range(0, len(data), 16):
+            words = struct.unpack_from(f"<{min(16, len(data) - i) // 4}I", data, i)
+            lines.append(f"0x{addr + i:08X}: " + " ".join(f"{w:08x}" for w in words))
+    else:
+        for i in range(0, len(data), 16):
+            lines.append(f"0x{addr + i:08X}: " + " ".join(f"{b:02x}" for b in data[i:i + 16]))
+    return lines
+
+
+def peek_spec(text):
+    """ADDR[:LEN] for peek, checked before the radio is opened"""
+    import argparse
+    spec = text.split(":", 1)
+    try:
+        addr = int(spec[0], 0)
+        n = int(spec[1], 0) if len(spec) > 1 else 4
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r}: ADDR[:LEN] in decimal or 0x hex, e.g. 0x14100040:0x10")
+    if not 0 <= addr <= 0xFFFFFFFF:
+        raise argparse.ArgumentTypeError("ADDR is 0..0xFFFFFFFF")
+    if n <= 0 or n > 64 * 1024:
+        raise argparse.ArgumentTypeError("LEN is 1..65536")
+    return addr, n
+
+
+def cmd_peek(link, a):
+    addr, n = a.where
+    why = mem_precheck(link, addr, n)
+    if why:
+        print(f"rfoundry_debug: {why}", file=sys.stderr)
+        return 2
+    try:
+        data = link.dump(addr, n)
+    except DebugLinkError as e:
+        if e.status == ST_REFUSED:
+            print(f"rfoundry_debug: the radio refused 0x{addr:08X}+0x{n:X} (outside its readable ranges)",
+                  file=sys.stderr)
+            return 1
+        if e.status == ST_UNAVAILABLE:
+            print("rfoundry_debug: this firmware has no READ_MEM on this radio", file=sys.stderr)
+            return 1
+        print(f"rfoundry_debug: peek failed: {e}", file=sys.stderr)
+        return 1
+    print("\n".join(format_peek(addr, data)))
+    return 0
+
+
+def storage_dump(link, out_dir, info=None):
+    """Read the settings ring, the journal and the calibration copy into out_dir (never inside a git tree), each
+    read twice and compared. Returns the file paths"""
+    import hashlib
+    info = info or link.storage_info()
+    c = link.chip()
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    paths = []
+    for name, (addr, size) in info["ranges"].items():
+        if size == 0:
+            continue
+        path = os.path.join(out_dir, f"storage_{c['uid'][0]:08X}_{stamp}_{name}_{addr:06X}.bin")
+        ok, why = dump_path_ok(path)
+        if not ok:
+            raise DebugLinkError(f"refusing: {why}")
+        data = link.storage_read(addr, size)
+        if link.storage_read(addr, size) != data:
+            raise DebugLinkError(f"{name}: two reads differ; not saved")
+        os.makedirs(out_dir, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+        print(f"{path}: {size} bytes from SPI flash 0x{addr:06X}, sha256 {hashlib.sha256(data).hexdigest()}")
+        paths.append(path)
+    return paths
+
+
+def cmd_storage(link, a):
+    if a.op != "info" and not a.out:
+        print("rfoundry_debug: storage dump and claim need --out DIR (outside any git tree)", file=sys.stderr)
+        return 2
+    info = link.storage_info()
+    if a.op == "info":
+        print(f"region   {info['region']}{' (claim pending)' if info['claim_pending'] else ''}")
+        for name, (addr, size) in info["ranges"].items():
+            print(f"{name:<11}0x{addr:06X} + 0x{size:X}")
+        return 0
+    if a.op == "dump":
+        storage_dump(link, a.out, info)
+        return 0
+    # claim
+    if info["region"] != "foreign":
+        print(f"rfoundry_debug: the region is {info['region']}: nothing to claim", file=sys.stderr)
+        return 1
+    storage_dump(link, a.out, info)
+    try:
+        link.storage_claim(link.chip()["token"])
+    except DebugLinkError as e:
+        if e.status == ST_REFUSED and e.data:
+            print(f"rfoundry_debug: the radio refused: {REBOOT_REASONS.get(e.data[0], e.data[0])}", file=sys.stderr)
+            return 1
+        raise
+    print("claimed: the radio erases the settings ring and the journal", file=sys.stderr)
+    end = time.monotonic() + 20
+    while time.monotonic() < end:
+        time.sleep(0.5)
+        if link.storage_info()["region"] == "ours":
+            print("region   ours")
+            return 0
+    print("rfoundry_debug: the region is not ours after 20 s (see `log`)", file=sys.stderr)
+    return 1
+
+
+def tone_estimate(x, rate=8000):
+    """Rough frequency of a tone in a block from its zero crossings (0 when there is no signal)"""
+    m = sum(x) / len(x)
+    y = [v - m for v in x]
+    if max(abs(v) for v in y) < 64:
+        return 0.0
+    crossings = [i for i in range(1, len(y)) if (y[i - 1] < 0) != (y[i] < 0)]
+    if len(crossings) < 3:
+        return 0.0
+    return (len(crossings) - 1) / 2 / ((crossings[-1] - crossings[0]) / rate)
+
+
+def cmd_aprobe(link, a):
+    args = a.args
+    num = lambda v: int(v, 0)
+    if a.op == "status":
+        st = link.probe_status()
+        owner = " (probe)" if st["ours"] else f" ({st['voice'].upper()} voice)" if st.get("voice") else ""
+        print(f"stream {'running' if st['running'] else 'stopped'}{owner}, blocks {st['blocks']}")
+        for ch in ("left", "right"):
+            c = st[ch]
+            print(f"{ch:<6} peak {c['peak']:5d}  rms {c['rms']:5d}  peak since start {c['peak_max']:5d}")
+    elif a.op == "reg":
+        if len(args) != 2:
+            raise SystemExit("aprobe reg PAGE REG")
+        p, r = num(args[0]), num(args[1])
+        print(f"{p}:0x{r:02X} = 0x{link.probe_reg(p, r):02X}")
+    elif a.op == "wreg":
+        if len(args) != 3:
+            raise SystemExit("aprobe wreg PAGE REG VALUE")
+        p, r, v = num(args[0]), num(args[1]), num(args[2])
+        print(f"{p}:0x{r:02X} <- 0x{v:02X}, reads 0x{link.probe_reg(p, r, v):02X}")
+    elif a.op == "start":
+        hz = num(args[0]) if len(args) > 0 else 0
+        amp = num(args[1]) if len(args) > 1 else 0
+        link.probe_start(hz, amp, len(args) > 2 and args[2] == "spk")
+        print(f"probe stream started, tone {hz} Hz at {amp}")
+    elif a.op == "stop":
+        link.probe_stop()
+        print("probe stream stopped")
+    elif a.op == "samples":
+        blocks, left, right = link.probe_samples()
+        print(f"block {blocks}: left ~{tone_estimate(left):.0f} Hz peak {max(map(abs, left))}, "
+              f"right ~{tone_estimate(right):.0f} Hz peak {max(map(abs, right))}")
+        if a.output:
+            with open(a.output, "wb") as f:
+                f.write(struct.pack(f"<{2 * PROBE_BLOCK}h", *(v for pair in zip(left, right) for v in pair)))
+            print(f"{a.output}: 8 kHz 16-bit stereo raw (left, right)")
+    elif a.op == "ram":
+        if len(args) != 3:
+            raise SystemExit("aprobe ram PAGE ADDR LEN")
+        p, addr, n = num(args[0]), num(args[1]), num(args[2])
+        data = link.probe_ram(p, addr, n)
+        if a.output:
+            with open(a.output, "wb") as f:
+                f.write(data)
+            print(f"{a.output}: {len(data)} bytes from {p}:0x{addr:03X}")
+        for i in range(0, len(data), 16):
+            print(f"{p}:{addr + i:03X}  " + " ".join(f"{b:02X}" for b in data[i:i + 16]))
+    elif a.op == "wram":
+        if len(args) != 3:
+            raise SystemExit("aprobe wram PAGE ADDR HEXBYTES")
+        p, addr, data = num(args[0]), num(args[1]), bytes.fromhex(args[2])
+        link.probe_ram(p, addr, data=data)
+        print(f"{p}:0x{addr:03X} <- {len(data)} bytes")
+    elif a.op == "music":
+        if len(args) not in (3, 4):
+            raise SystemExit("aprobe music MS HZ AMP [le]   (open the path first: aprobe wreg 4 0x06 <value | 0x02>)")
+        m = link.probe_music(num(args[0]), num(args[1]), num(args[2]), len(args) == 4 and args[3] == "le")
+        print(f"{m['writes']} FIFO writes of 32 samples in {m['elapsed_ms']} ms "
+              f"({m['writes'] * 32 * 1000 / max(m['elapsed_ms'], 1):.0f} samples/s), {m['polls']} polls")
+    elif a.op == "mod":
+        if len(args) not in (3, 5):
+            raise SystemExit("aprobe mod MS HZ STEPS [PAGE REG]   (default 4 0x04, the FM Mod2 offset)")
+        pr = (num(args[3]), num(args[4])) if len(args) == 5 else (4, 0x04)
+        m = link.probe_mod(num(args[0]), num(args[1]), num(args[2]), *pr)
+        print(f"{m['writes']} writes in {m['elapsed_ms']} ms ({m['writes'] * 1000 / max(m['elapsed_ms'], 1):.0f}/s) "
+              f"around 0x{m['base']:02X}")
+    elif a.op == "watch":
+        if len(args) not in (2, 3):
+            raise SystemExit("aprobe watch MS MASK [RAMADDR]   (page 4 flags 0x82 cleared through 0x83; RAM page 2)")
+        w = link.probe_watch(num(args[0]), num(args[1]), ram_addr=num(args[2]) if len(args) == 3 else PROBE_NO_RAM)
+        print(f"{w['elapsed_ms']} ms, {w['polls']} polls, RAM word changed {w['ram_changes']} times")
+        for b, (count, first) in w["bits"].items():
+            if count:
+                print(f"  0x82 bit {b}: {count} times ({count * 1000 / max(w['elapsed_ms'], 1):.1f}/s), first at "
+                      f"{first} ms")
+    return 0
+
+
+def cmd_crash(link, a):
+    if a.op == "clear":
+        link.crash_clear()
+        print("crash record cleared")
+    elif a.op == "test":
+        if a.kind not in CRASH_TESTS:
+            print(f"crash test: one of {', '.join(CRASH_TESTS)}", file=sys.stderr)
+            return 2
+        link.crash_test(a.kind)
+        print(f"crash test '{a.kind}' sent: the radio restarts")
+    else:
+        for k, v in link.view(["crash"]).items():
+            if k.startswith("crash."):
+                print(f"{k}={v}")
+    return 0
+
+
+def watchdog_poll(link, limit_s=120.0):
+    """Read the watchdog section until the link goes quiet (the reset); the last watchdog.starved_ms the radio gave is
+    how long it ran without a feed, so the timeout is at least that and at most that plus one poll."""
+    last, t0 = None, time.monotonic()
+    while time.monotonic() - t0 < limit_s:
+        try:
+            v = link.view(["watchdog"])
+        except (DebugLinkError, OSError):    # a time-out (UART), or the USB port gone with the reset
+            break
+        if "watchdog.starved_ms" in v:
+            last = int(v["watchdog.starved_ms"])
+        time.sleep(0.05)
+    else:
+        print(f"still answering after {limit_s:g} s: no reset (is the load far longer than expected?)")
+        return 1
+    if last is None:
+        print("the link went quiet before the first starved reading")
+        return 1
+    print(f"last answer at watchdog.starved_ms={last}: the timeout is about {last / 1000:.2f} s "
+          f"(plus up to one poll, about 0.1 s)")
+    return 0
+
+
+def cmd_watchdog(link, a):
+    if a.op == "clear-gap":
+        link.watchdog_clear_gap()
+        print("longest idle gap cleared")
+    elif a.op == "test":
+        kind = a.args[0] if a.args else "starve"
+        if kind not in WDT_TESTS:
+            print(f"watchdog test: one of {', '.join(WDT_TESTS)}", file=sys.stderr)
+            return 2
+        link.watchdog_test(kind)
+        print(f"watchdog test '{kind}' sent: the radio resets within the timeout")
+        if kind == "starve":
+            return watchdog_poll(link)
+    elif a.op == "load":
+        if len(a.args) not in (2, 3):
+            print("watchdog load H L [RST]", file=sys.stderr)
+            return 2
+        hi, lo = int(a.args[0], 0), int(a.args[1], 0)
+        rst = int(a.args[2], 0) if len(a.args) == 3 else WDT_LEAVE
+        link.watchdog_load(hi, lo, rst)
+        print(f"watchdog re-armed with OT_LOAD_H=0x{hi:X} OT_LOAD_L=0x{lo:X}, feeds stopped")
+        return watchdog_poll(link)
+    else:
+        for k, v in link.view(["watchdog"]).items():
+            if k.startswith("watchdog."):
+                print(f"{k}={v}")
+
+
+def cmd_hwopt(link, a):
+    opts = link.hwopts()
+    if a.option is not None:
+        names = [o["name"].lower() for o in opts]
+        i = int(a.option) if a.option.isdigit() else names.index(a.option.lower()) if a.option.lower() in names else -1
+        if not 0 <= i < len(opts) or a.choice not in opts[i]["choices"]:
+            print("hwopt: OPTION (number or name) and one of its choices; see `hwopt` for the list", file=sys.stderr)
+            return 2
+        link.hwopt_set(i, opts[i]["choices"].index(a.choice))
+        due = link.hwopts()[i]["state"] == "restart"
+        print(f"{opts[i]['name']} = {a.choice}" + (" (from the next start-up)" if due else ""))
+        return 0
+    for i, o in enumerate(opts):
+        v = o["choices"][o["value"]] if 0 <= o["value"] < len(o["choices"]) else "not set"
+        print(f"{i} {o['name']}: {v}  ({' | '.join(o['choices'])})  {o['state']}")
+    if not opts:
+        print("no hardware options on this radio")
+    return 0
+
+
+def cmd_air(link, a):
+    if a.op == "status":
+        st = link.air_status()
+        for k, v in st.items():
+            print(f"{k}={v}")
+        if int(st.get("air.rx_span_us", "0")):      # what receive costs the radio's CPU (hal_air_t.rx_load)
+            print(f"air.rx_load_pct={100 * int(st['air.rx_work_us']) / int(st['air.rx_span_us']):.1f}")
+    elif a.op == "tap":
+        if not a.out:
+            print("air tap: --out FILE.raw", file=sys.stderr)
+            return 2
+        info = link.air_tap_start(a.bits, a.shift)
+        n, gaps, t0 = 0, 0, None
+        try:
+            with open(a.out, "wb") as f:
+                end = time.monotonic() + a.seconds
+                while time.monotonic() < end:
+                    seq, t_us, gaps, data = link.air_tap_read(a.bits)
+                    t0 = t_us if t0 is None else t0
+                    f.write(data)
+                    n += len(data) // (2 if a.bits == 16 else 1)
+                    if not data:
+                        time.sleep(0.01)
+        finally:
+            link.air_tap_stop()
+        fmt = "int16 LE" if a.bits == 16 else f"int8 (>> {a.shift})"
+        print(f"{n} samples, {fmt}, {info['rate_hz']} Hz, band {info['lo_hz']}-{info['hi_hz']} Hz, "
+              f"counts/kHz {info['counts_per_khz'] or 'unknown'}, {info['channels']} channel(s), {gaps} gap(s) -> {a.out}")
+        return 1 if gaps else 0
+    elif a.op == "open":
+        prof = dict(AIR_PROFILES[a.profile])
+        if a.dev:
+            prof["dev_outer_hz"] = a.dev
+        r = link.air_open(prof, soft=not a.hard_only)
+        print(f"open: fit {' '.join(r['fit'])}; tx chunks of {r['tx_chunk_syms']} symbols, {r['tx_queue_depth']} queued")
+    elif a.op == "close":
+        link.air_close()
+        print("closed")
+    elif a.op == "restart":
+        link.air_rx_restart()
+    elif a.op == "abort":
+        link.air_tx_abort()
+    elif a.op == "rx":
+        if not a.out:
+            print("air rx: --out FILE.jsonl", file=sys.stderr)
+            return 2
+        chunks, dropped = 0, 0
+        with open(a.out, "w") as f:
+            end = time.monotonic() + a.seconds
+            while time.monotonic() < end:
+                dropped, recs = link.air_rx_read()
+                for c in recs:
+                    c["hard"] = c["hard"].hex()
+                    c["flags"] = [n for bit, n in AIR_CHUNK_FLAGS.items() if c["flags"] & bit]
+                    f.write(json.dumps(c) + "\n")
+                chunks += len(recs)
+                if not recs:
+                    time.sleep(0.02)
+        print(f"{chunks} chunks, {dropped} dropped on the radio -> {a.out}")
+        return 1 if dropped else 0
+    elif a.op == "tx":
+        if not a.syms:
+            print("air tx: --syms FILE (dibits packed four to a byte, the first in bits 7-6)", file=sys.stderr)
+            return 2
+        with open(a.syms, "rb") as f:
+            data = f.read()
+        nsyms = a.nsyms or len(data) * 4
+        st = link.air_status()
+        per = int(st.get("air.tx_chunk_syms", "144"))
+        chunks = [(data[i // 4:(i + per) // 4], min(per, nsyms - i)) for i in range(0, nsyms, per)]
+        if not chunks:
+            return 2
+        max_ms = a.max_ms or min(30000, 1000 + nsyms * 1000 // 4800)
+        sent, keyed = 0, False
+        deadline = time.monotonic() + max_ms / 1000 + 2
+        while sent < len(chunks) and time.monotonic() < deadline:
+            syms, n = chunks[sent]
+            space = link.air_tx_data(syms[:(n + 3) // 4], n, last=sent == len(chunks) - 1)
+            if space is None:
+                if not keyed:
+                    break           # the queue full before the key: key now
+                time.sleep(0.005)
+                continue
+            sent += 1
+            if not keyed and (space == 0 or sent == len(chunks)):
+                link.air_tx_key(max_ms)
+                keyed = True
+        if not keyed:
+            link.air_tx_key(max_ms)
+        while sent < len(chunks) and time.monotonic() < deadline:
+            syms, n = chunks[sent]
+            if link.air_tx_data(syms[:(n + 3) // 4], n, last=sent == len(chunks) - 1) is None:
+                time.sleep(0.005)
+            else:
+                sent += 1
+        done0 = int(st.get("air.tx_done", "0"))
+        while time.monotonic() < deadline:
+            st = link.air_status()
+            if int(st.get("air.tx_done", "0")) > done0:
+                break
+            time.sleep(0.05)
+        else:
+            link.air_tx_abort()
+            print(f"air tx: no TX_DONE in time, aborted ({sent} of {len(chunks)} chunks)", file=sys.stderr)
+            return 1
+        print(f"{nsyms} symbols in {len(chunks)} chunks; underruns {st.get('air.tx_underruns')}, "
+              f"on air {(int(st['air.tx_done_us']) - int(st['air.tx_started_us'])) / 1000:.0f} ms")
+    return 0
+
+
+def cmd_reboot(link, a):
+    c = link.chip()
+    print_chip(c)
+    mode = REBOOT_ROM_DFU if a.rom_dfu else REBOOT_NORMAL
+    if mode == REBOOT_ROM_DFU and (c["family"] != CHIP_STM32F4 or c["rdp"] != 0):
+        print("rfoundry_debug: refusing ROM DFU: not an STM32F4 at RDP level 0", file=sys.stderr)
+        return 1
+    try:
+        link.reboot(mode, c["token"])
+    except DebugLinkError as e:
+        if e.status == ST_REFUSED and e.data:
+            print(f"rfoundry_debug: the radio refused: {REBOOT_REASONS.get(e.data[0], e.data[0])}", file=sys.stderr)
+            return 1
+        raise
+    if mode == REBOOT_ROM_DFU:
+        print("rebooting into the ROM bootloader: look for USB 0483:DF11 'STM32 BOOTLOADER' "
+              "(then tools/stm32_dfu.py --rom IMAGE.bin)")
+    else:
+        print("rebooting")
+    return 0
+
+
+def self_test():
+    """The packed screenshot reader against a simulated radio (the firmware's side is tests/host/debuglinkTest)."""
+    stubtool = stubtool_module()
+    ok = True
+
+    def check(cond, what):
+        nonlocal ok
+        print("%s %s" % ("ok  " if cond else "FAIL", what))
+        ok = ok and cond
+
+    class FakeRadio(DebugLink):
+        """Answers SCREENSHOT as debuglink.md 3.3 says: a panel of 16 colors, 3 rows of fb, or firmware without the
+        packed form (packed False, or the status it answers). redraw_at: the reply at which a new frame is drawn;
+        shrink: that frame is blank, so its stream is shorter."""
+
+        def __init__(self, packed=True, redraw_at=None, drawing=0, shrink=False, fb=None):
+            self.packed_shots, self.packed, self.redraw_at, self.drawing = None, packed, redraw_at, drawing
+            self.shrink, self.replies, self.frame = shrink, 0, 7
+            self.fb = fb or bytes([0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x00])
+            self.w = len(self.fb) * 2 // 3
+            self.pal = [0x1000 + i for i in range(16)]
+
+        def request(self, cmd, payload=b""):
+            self.replies += 1
+            if self.replies == self.redraw_at:
+                self.frame += 1
+                self.fb = bytes(len(self.fb)) if self.shrink else bytes(b ^ 0xFF for b in self.fb)
+            if len(payload) == 5:
+                if self.packed != True:
+                    raise DebugLinkError("refused", self.packed or ST_BAD_ARG)
+                off = struct.unpack_from("<I", payload)[0]
+                z = bytes(stubtool.lz4_encode(self.fb))
+                if off > len(z):
+                    raise DebugLinkError("bad argument", ST_BAD_ARG)
+                chunk = z[off:off + 4]          # small windows: several replies
+                drawing = self.drawing > 0
+                self.drawing -= 1
+                r = struct.pack("<HHBBBBBBIIIIB", self.w, 3, 4, SHOT_LZ4, 1, 0, 0, 0, len(z), off, len(self.fb), self.frame,
+                                drawing) + struct.pack("<16H", *self.pal) + chunk
+                return 0, r
+            rgb = b"".join(struct.pack("<H", self.pal[(self.fb[i // 2] >> (0 if i & 1 else 4)) & 15])
+                           for i in range(self.w * 3))
+            off, n = struct.unpack_from("<IH", payload) if payload else (0, 0)
+            return 0, struct.pack("<HHBBBBBBII", self.w, 3, 16, 1, 1, 0, 0, 0, len(rgb), off) + rgb[off:off + n]
+
+    want = b"".join(struct.pack("<H", 0x1000 + i) for i in range(16)) + struct.pack("<HH", 0x1000, 0x1000)
+    info, data, stable = FakeRadio().screenshot()
+    check(stable and info["packed"] and data == want, "packed: 16 colors decode to RGB565 through the palette")
+    check((info["bpp"], info["format"], info["total"], info["native_bpp"]) == (16, 1, 36, 4), "packed: info as RGB565")
+    check(to_rgb(info, data)[:2] == (6, 3), "packed: to_rgb takes it")
+    r = FakeRadio(redraw_at=2)
+    info, data, stable = r.screenshot()
+    check(stable and r.replies > 2 and data != want, "a frame drawn during a pass: read again")
+    r = FakeRadio(drawing=1)
+    info, data, stable = r.screenshot()
+    check(stable and r.packed_shots, "first chunk during a draw: read again")
+    r = FakeRadio(drawing=99)
+    info, data, stable = r.screenshot(tries=2)
+    check(not stable and data is not None, "always drawing: the last read, not stable")
+    r = FakeRadio(redraw_at=4, shrink=True, fb=bytes(range(0, 252, 7)))
+    info, data, stable = r.screenshot()
+    check(stable and r.packed_shots and r.replies > 4 and data == struct.pack("<H", 0x1000) * 72, "a shorter frame drawn during the first pass: read again")
+    r = FakeRadio(packed=False)
+    info, data, stable = r.screenshot()
+    check(stable and r.packed_shots is False and data == want and "packed" not in info, "old firmware: RGB565 form")
+    r = FakeRadio(packed=ST_UNAVAILABLE)
+    info, data, stable = r.screenshot()
+    check(stable and r.packed_shots is False and data == want, "frame buffer too large to pack: RGB565 form")
+    check(format_peek(0x14100040, struct.pack("<5I", 0xC0, 0, 0xC0, 0xC0, 1)) ==
+          ["0x14100040: 000000c0 00000000 000000c0 000000c0", "0x14100050: 00000001"], "peek: words")
+    check(format_peek(0x00010001, b"\x01\x02\x03") == ["0x00010001: 01 02 03"], "peek: bytes")
+    check(mem_allowed(0x14100040, 4, CHIP_HRC7000) and not mem_allowed(0x14100042, 4, CHIP_HRC7000) and
+          not mem_allowed(0x14030000, 4, CHIP_HRC7000) and not mem_allowed(0x00010000, 4, CHIP_STM32F4) and
+          mem_allowed(0xE000ED00, 4, CHIP_STM32F4) and not mem_allowed(0xE000ED02, 2, CHIP_STM32F4),
+          "READ_MEM windows by family")
+    # Restart and write commands never guess between radios: a serial cable may carry one too
+    saved = (find_ports, find_cables, find_network_radios, os.environ.pop("RFOUNDRY_PORT", None))
+    g = globals()
+    try:
+        g["find_network_radios"] = lambda: []
+        g["find_ports"], g["find_cables"] = (lambda: ["/dev/usbmodem1"]), (lambda: ["/dev/usbserial1"])
+        ap_ = argparse.Namespace
+        reboot, view = ap_(cmd="reboot"), ap_(cmd="view")
+        check(changes_radio(reboot) and not changes_radio(view) and changes_radio(ap_(cmd="ptt")) and
+              changes_radio(ap_(cmd="crash", op="test")) and not changes_radio(ap_(cmd="crash", op="show")) and
+              changes_radio(ap_(cmd="hwopt", option="x", choice="V4")) and not changes_radio(ap_(cmd="hwopt", option=None, choice=None)) and
+              changes_radio(ap_(cmd="reg", chip=1, reg=2, value=3)) and not changes_radio(ap_(cmd="reg", chip=1, reg=2, value=None)),
+              "restart and write commands told from reads")
+        try:
+            pick_port(None, True)
+            refused = False
+        except DebugLinkError as e:
+            refused = "give --port" in str(e)
+        check(refused, "a restart with a native radio and a serial cable attached and no --port: refused")
+        check(pick_port(None, False) == "/dev/usbmodem1", "a read picks the one native radio")
+        check(pick_port("/dev/usbserial1", True) == "/dev/usbserial1", "a restart with --port: that port")
+        g["find_cables"] = lambda: []
+        check(pick_port(None, True) == "/dev/usbmodem1", "a restart with one radio and no cable: that radio")
+        g["find_ports"] = lambda: ["/dev/usbmodem1", "/dev/usbmodem2"]
+        try:
+            pick_port(None, False)
+            refused = False
+        except DebugLinkError:
+            refused = True
+        check(refused, "two native radios, no --port: refused")
+    finally:
+        g["find_ports"], g["find_cables"], g["find_network_radios"] = saved[:3]
+        if saved[3] is not None:
+            os.environ["RFOUNDRY_PORT"] = saved[3]
+    print("rfoundry_debug self-test:", "ok" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+def main(argv=None):
+    if (sys.argv[1:] if argv is None else argv) == ["--self-test"]:
+        return self_test()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--port", help="serial port (default: the radio with USB ID 1FC9:0094, or $RFOUNDRY_PORT)")
+    ap.add_argument("--timeout", type=float, default=1.0, help="seconds to wait for each answer")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("ping")
+    sub.add_parser("version")
+    p = sub.add_parser("diag")
+    p.add_argument("--watch", type=float, metavar="N", help="repeat every N seconds, with counter rates")
+    p.add_argument("--raw", action="store_true", help="the lines only")
+    p = sub.add_parser("view")
+    p.add_argument("--section", choices=VIEW_SECTIONS, action="append")
+    p.add_argument("--json", action="store_true")
+    sub.add_parser("reset")
+    p = sub.add_parser("screenshot")
+    p.add_argument("-o", "--output", required=True)
+    p.add_argument("--scale", type=int, default=1)
+    p.add_argument("--crop", action="store_true", help="leave out the insets hidden by the bezel")
+    p.add_argument("--tries", type=int, default=4, help="reads until one is whole (old firmware: two agree)")
+    p = sub.add_parser("key")
+    p.add_argument("name", nargs="?")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--long", action="store_true")
+    g.add_argument("--hold", type=int, metavar="MS")
+    g.add_argument("--repeat", type=int, metavar="N", help="long press, then N repeats")
+    g.add_argument("--down", action="store_true", help="raw edge keys (monitor): press and keep (10 s at most)")
+    g.add_argument("--up", action="store_true")
+    g.add_argument("--steps", type=int, help="enc: detents (negative: the other way)")
+    p.add_argument("--mask", help="physical key bits (board specific), with --hold")
+    sub.add_parser("wake")
+    p = sub.add_parser("ptt")
+    p.add_argument("--seconds", type=float, required=True)
+    p = sub.add_parser("aprs", help="APRS: send now, status, message, test call, settings, NMEA (docs/spec/aprs.md)")
+    p.add_argument("op", choices=["send", "status", "msg", "call", "set", "nmea"])
+    p.add_argument("args", nargs="*", help="status: TEXT; msg: CALL TEXT; call: [CALLSIGN]; set: FIELD VALUE "
+                   f"(fields {', '.join(APRS_FIELDS)}; region na|eu|au|nz|jp|cn|custom, pos_src auto|gps|host|fixed, "
+                   "via rf|dmr|both, lat / lon in degrees, freq_hz in Hz or MHz with a point); nmea: SENTENCE")
+    p = sub.add_parser("snmp", help="the SNMP agent: status, settings, communities, test notification "
+                       "(docs/spec/snmp.md)")
+    p.add_argument("op", choices=["status", "set", "read", "write", "trap"])
+    p.add_argument("args", nargs="*", help="set: FIELD VALUE (fields " + ", ".join(SNMP_FIELDS) + "; flags as a "
+                   "number or names " + ",".join(SNMP_FLAGS) + "); read / write: [COMMUNITY] (none: the default)")
+    p = sub.add_parser("volume", help="speaker volume: print it, or set a step 0..volume.max / 'knob' to give the knob "
+                       "back (RADIO op 30; docs/spec/debuglink.md 3.8)")
+    p.add_argument("value", nargs="?", help="step 0..16 (0 mutes), or knob")
+    p = sub.add_parser("radio")
+    p.add_argument("op", choices=["channel", "pos", "zone", "vfo", "freq", "step", "power", "squelch", "bw", "tone",
+                                  "monitor", "clear", "reply-cancel", "hotspot-exit", "target", "contact", "call-back",
+                                  "target-clear", "privacy", "scan", "scan-vfo", "beep", "burst", "set", "usb",
+                                  "usb-settings", "ppp", "vibrate", "mode", "cc", "ts", "sfr", "copy-vfo", "voice-test", "dtmf",
+                                  "tx-limit", "tx-drive", "pa-keyup", "pa-sweep", "pa-keyrun", "p25", "nxdn", "ysf"])
+    p.add_argument("args", nargs="*")
+    p = sub.add_parser("data", help="DMR data: sms, call alert, radio check, settings, inbox")
+    p.add_argument("op", choices=["sms", "alert", "check", "settings", "inbox", "read", "emergency", "em-settings",
+                                  "ip-settings", "ip-send", "tx-spacing"])
+    p.add_argument("args", nargs="*", help="sms: ID TEXT [--group] [--no-ack] [--format tms|etsi|etsi_ip|default]; "
+                   "alert / check: ID; settings: ARS_ID [check-reply] [no-alert-ack] [no-lrrp] [sms-etsi|sms-tms] "
+                   "[check-etsi]; inbox / read: [INDEX]; emergency: start|cancel|dismiss; em-settings: "
+                   "alarm|alarm_call|call [DST] [private] [etsi] [no-tone] [tries=N] [hot=S]; ip-settings: off|auto|all "
+                   "[off|rules|all] [tries=N] [id=ID] [port=N] [gateway=ID]; ip-send: ID[@A.B.C.D] SRC_PORT DST_PORT "
+                   "[TEXT] [--group]; tx-spacing: GUARD_MS [chain|no-chain]")
+    p.add_argument("--format", choices=["tms", "etsi", "etsi_ip", "default"], default="default")
+    p.add_argument("--group", action="store_true")
+    p.add_argument("--no-ack", action="store_true")
+    p = sub.add_parser("log")
+    p.add_argument("--follow", action="store_true")
+    sub.add_parser("chip")
+    p = sub.add_parser("dump")
+    p.add_argument("--addr", required=True)
+    p.add_argument("--len", required=True)
+    p.add_argument("-o", "--output", required=True, help="file outside any git tree")
+    p = sub.add_parser("peek", help="hex dump of a few bytes: RAM, flash, or the registers READ_MEM allows "
+                       "(docs/spec/debuglink.md 3.10)")
+    p.add_argument("where", metavar="ADDR[:LEN]", type=peek_spec, help="e.g. 0x14100040 or 0x17000060:0x30 (LEN default 4)")
+    p = sub.add_parser("reboot")
+    p.add_argument("--rom-dfu", action="store_true", help="into ST's ROM USB DFU (refused unless RDP level 0)")
+    p = sub.add_parser("crash", help="the crash log: show, clear, test trap|assert (docs/spec/crash-log.md)")
+    p.add_argument("op", nargs="?", default="show", choices=["show", "clear", "test"])
+    p.add_argument("kind", nargs="?", default="trap")
+    p = sub.add_parser("watchdog", help="the hardware watchdog: show, clear-gap, test starve|spin|irq-off, load H L [RST] "
+                       "(docs/spec/watchdog.md)")
+    p.add_argument("op", nargs="?", default="show", choices=["show", "clear-gap", "test", "load"])
+    p.add_argument("args", nargs="*")
+    p = sub.add_parser("rx2", help="the second receiver's SoC: info, restart (the update bridge is stubtool's, "
+                       "docs/spec/debuglink.md 3.22)")
+    p.add_argument("op", nargs="?", default="info", choices=["info", "restart"])
+    p = sub.add_parser("hwopt", help="hardware options: list, or set OPTION CHOICE (docs/spec/debuglink.md 3.25)")
+    p.add_argument("option", nargs="?", help="number or name, e.g. 'Board revision'")
+    p.add_argument("choice", nargs="?", help="one of the option's choices, e.g. V4A/V5")
+    p = sub.add_parser("air", help="the air interface on the bench (CONFIG_AIR_RAW builds; docs/spec/debuglink.md 3.28)")
+    p.add_argument("op", choices=["status", "tap", "open", "rx", "tx", "restart", "abort", "close"])
+    p.add_argument("--seconds", type=float, default=5.0, help="tap, rx: how long")
+    p.add_argument("--out", help="tap: raw samples; rx: one JSON chunk per line")
+    p.add_argument("--bits", type=int, choices=[8, 16], default=16, help="tap: sample width (8 halves the link load)")
+    p.add_argument("--shift", type=int, default=8, help="tap --bits 8: right shift before the clip")
+    p.add_argument("--profile", choices=sorted(AIR_PROFILES), default="p25", help="open: the mode's profile")
+    p.add_argument("--dev", type=int, help="open: outer deviation in Hz instead of the profile's")
+    p.add_argument("--hard-only", action="store_true", help="open: no soft values in the receive records")
+    p.add_argument("--syms", help="tx: symbol file, dibits packed four to a byte, the first in bits 7-6")
+    p.add_argument("--nsyms", type=int, help="tx: symbols in the file (default: all of it)")
+    p.add_argument("--max-ms", type=int, help="tx: the transmission's cap (default: its length + 1 s, 30 s at most)")
+    p = sub.add_parser("t3", help="a Tier III trunked system (docs/spec/debuglink.md 3.26): show (the t3 view), "
+                       "start, stop, dereg, end, or setup: reset then stage one from the options and start it")
+    p.add_argument("op", nargs="?", default="show",
+                   choices=["show", "setup", "start", "stop", "dereg", "end", "status", "sdata", "interrupt",
+                            "als-end"])
+    p.add_argument("--to", type=int, default=0, help="status: the MS or talkgroup (--group)")
+    p.add_argument("--status", type=int, default=0, help="status: 0-126, or 127 to poll an MS")
+    p.add_argument("--group", action="store_true", help="status, sdata: --to is a talkgroup")
+    p.add_argument("--text", help="sdata: ISO 8-bit text, up to 46 characters")
+    p.add_argument("--hex", help="sdata: binary octets in hex, up to 46")
+    p.add_argument("--own-id", type=int, default=0)
+    p.add_argument("--model", type=int, default=0)
+    p.add_argument("--net", type=int, default=0)
+    p.add_argument("--par", default="a")
+    p.add_argument("--cc", type=int, default=1)
+    p.add_argument("--dmrla", type=int, default=0, help="SITE bits of a registration area")
+    p.add_argument("--leave-dbm", type=int, default=0, help="leave a TSCC below this (0: the radio's roaming threshold)")
+    p.add_argument("--opts", type=lambda x: int(x, 0), default=0x21,
+                   help="T3_OPT_*; default 0x21: listen only (never transmits), private calls")
+    p.add_argument("--ctrl", action="append", default=[], metavar="LCN:RX_MHZ:TX_MHZ[:CC]")
+    p.add_argument("--chan", action="append", default=[], metavar="LCN:RX_MHZ:TX_MHZ[:CC]")
+    p.add_argument("--tg", action="append", default=[], type=int,
+                   help="listen; the first also talks. With --opts 0x40 (register with the talkgroup) and two or more, "
+                   "registration subscribes to the first seven as a list")
+    p.add_argument("--talk", type=int, default=0, help="PTT's target (16777215 = ALLMSID: an all-call)")
+    p.add_argument("--private", action="store_true")
+    p.add_argument("--broadcast", action="append", default=[], type=int,
+                   help="a talkgroup whose calls from the radio are broadcasts (one-way)")
+    p.add_argument("--ip-gw", action="store_true", help="IP through the system's gateway; the address advised at registration")
+    p.add_argument("--ps-rq", type=int, default=0, help="power save asked for at registration: 0 off, 1-7 = 1:2-1:128")
+    p.add_argument("--no-start", action="store_true")
+    p = sub.add_parser("iddb", help="the DMR ID database: its format and records, and the text for each ID given "
+                       "(docs/spec/debuglink.md 3.23)")
+    p.add_argument("ids", nargs="*", type=int)
+    p = sub.add_parser("reg", help="a register: read, or write then read back. CHIP is the board's RF chip number "
+                       "(its hardware page) or soc for the SoC's own, REG then a 32-bit address "
+                       "(docs/spec/debuglink.md 3.24)")
+    p.add_argument("chip", type=lambda x: CHIP_SOC if x == "soc" else int(x, 0))
+    p.add_argument("reg", type=lambda x: int(x, 0))
+    p.add_argument("value", nargs="?", type=lambda x: int(x, 0))
+    p.add_argument("--page", type=lambda x: int(x, 0), default=0)
+    p = sub.add_parser("split", help="split duplex: view, BS framing experiment variant (docs/spec/split-duplex.md 10.1)")
+    p.add_argument("op", choices=["view", "variant"])
+    p.add_argument("args", nargs="*", help="variant: N [REG=VAL ...] (hex or decimal)")
+    p = sub.add_parser("storage", help="the settings / journal region: info, dump, claim (docs/spec/settings-store.md 5)")
+    p.add_argument("op", choices=["info", "dump", "claim"])
+    p.add_argument("--out", help="dump directory outside any git tree (required for dump and claim)")
+    p = sub.add_parser("aprobe", help="audio probe: chip registers and PCM levels (CONFIG_AUDIO_PROBE builds)")
+    p.add_argument("op", choices=["status", "reg", "wreg", "start", "stop", "samples", "ram", "wram", "watch", "music",
+                                     "mod"])
+    p.add_argument("args", nargs="*")
+    p.add_argument("-o", "--output", help="samples: also write the block as raw 16-bit stereo; ram: the bytes")
+    a = ap.parse_args(argv)
+
+    if a.cmd == "ptt" and not 0 < a.seconds <= INJECT_MAX_S:
+        ap.error(f"--seconds must be > 0 and <= {INJECT_MAX_S:g}")
+    try:
+        port = a.port if a.port else pick_port(None, changes_radio(a))
+        with DebugLink(port, a.timeout) as link:
+            if a.cmd == "ping":
+                print(f"{link.port}: pong in {link.ping() * 1000:.1f} ms")
+            elif a.cmd == "version":
+                for k, v in link.version().items():
+                    print(f"{k}={v}")
+            elif a.cmd == "diag":
+                return cmd_diag(link, a)
+            elif a.cmd == "view":
+                v = link.view(a.section)
+                print(json.dumps(v, indent=1) if a.json else "\n".join(f"{k}={x}" for k, x in v.items()))
+            elif a.cmd == "reset":
+                print(f"counters reset at t={link.reset() / 1000:.3f} s")
+            elif a.cmd == "screenshot":
+                return cmd_screenshot(link, a)
+            elif a.cmd == "key":
+                return cmd_key(link, a)
+            elif a.cmd == "wake":
+                link.wake()
+            elif a.cmd == "ptt":
+                link.ptt_for(a.seconds)
+                print(f"PTT held {a.seconds:g} s, released")
+            elif a.cmd == "radio":
+                return cmd_radio(link, a)
+            elif a.cmd == "volume":
+                return cmd_volume(link, a)
+            elif a.cmd == "data":
+                return cmd_data(link, a)
+            elif a.cmd == "aprs":
+                return cmd_aprs(link, a)
+            elif a.cmd == "snmp":
+                return cmd_snmp(link, a)
+            elif a.cmd == "chip":
+                print_chip(link.chip())
+            elif a.cmd == "dump":
+                return cmd_dump(link, a)
+            elif a.cmd == "peek":
+                return cmd_peek(link, a)
+            elif a.cmd == "reboot":
+                return cmd_reboot(link, a)
+            elif a.cmd == "crash":
+                return cmd_crash(link, a)
+            elif a.cmd == "watchdog":
+                return cmd_watchdog(link, a)
+            elif a.cmd == "hwopt":
+                return cmd_hwopt(link, a)
+            elif a.cmd == "air":
+                return cmd_air(link, a)
+            elif a.cmd == "storage":
+                return cmd_storage(link, a)
+            elif a.cmd == "rx2":
+                if a.op == "restart":
+                    link.rx2_restart()
+                    print("second receiver restarting")
+                else:
+                    flags = link.rx2_info()
+                    print("rx2: " + (", ".join(n for n in RX2_FLAGS.values() if n in flags) or "none"))
+            elif a.cmd == "t3":
+                def chan(text):
+                    f = text.split(":")
+                    return (int(f[0]), round(float(f[1]) * 1e6), round(float(f[2]) * 1e6),
+                            int(f[3]) if len(f) > 3 else 0xFF)
+                if a.op == "setup":
+                    link.t3_reset()
+                    link.t3_system(a.own_id, a.model, a.net, a.par, a.opts, a.cc, a.talk, a.private, a.dmrla,
+                                   a.leave_dbm, ip_gw=a.ip_gw)
+                    for c in a.ctrl:
+                        link.t3_ctrl(*chan(c))
+                    for c in a.chan:
+                        link.t3_chan(*chan(c))
+                    for i, tg in enumerate(a.tg):
+                        link.t3_tg(tg, True, i == 0, tg in a.broadcast)
+                    if a.ps_rq:
+                        link.t3_power_save(a.ps_rq)
+                    if not a.no_start:
+                        link.t3("start")
+                elif a.op == "status":
+                    link.t3_status(a.to, a.status, a.group)
+                elif a.op == "sdata":
+                    if a.hex is not None:
+                        link.t3_sdata(a.to, bytes.fromhex(a.hex), a.group, "binary")
+                    else:
+                        link.t3_sdata(a.to, (a.text or "").encode("latin-1"), a.group, "iso8")
+                elif a.op in ("interrupt", "als-end"):
+                    link.t3_interrupt(a.op == "als-end")
+                elif a.op != "show":
+                    link.t3(a.op)
+                for k, v in link.view(sections=["t3", "t3_svc", "t3_roam", "t3_msg", "t3_ra"]).items():
+                    print(f"{k}={v}")
+            elif a.cmd == "iddb":
+                d = link.iddb()
+                print(f"format={d['format'] or 'none'} records={d['records']}")
+                for i in a.ids:
+                    r = link.iddb(i)
+                    print(f"{i} {r['text']!r}" if r["found"] else f"{i} -")
+            elif a.cmd == "reg":
+                if a.chip == CHIP_SOC:
+                    v = link.soc_reg(a.reg, a.value)
+                    print(f"soc 0x{a.reg:08X} = 0x{v:08X}")
+                else:
+                    v = link.chip_reg(a.chip, a.reg, a.value, a.page)
+                    print(f"chip {a.chip} page {a.page} 0x{a.reg:02X} = 0x{v:04X}")
+            elif a.cmd == "aprobe":
+                return cmd_aprobe(link, a)
+            elif a.cmd == "split":
+                if a.op == "view":
+                    for k, v in link.split_view().items():
+                        print(f"{k}={v}")
+                else:
+                    if not a.args:
+                        ap.error("split variant N [REG=VAL ...]")
+                    regs = [tuple(int(x, 0) for x in r.split("=", 1)) for r in a.args[1:]]
+                    link.split_variant(int(a.args[0], 0), regs)
+                    print(f"variant {a.args[0]} set: used at the TX half's next key-up")
+            elif a.cmd == "log":
+                while True:
+                    dropped, text = link.log()
+                    if dropped:
+                        print(f"({dropped} lines dropped)")
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                    if not a.follow:
+                        break
+                    time.sleep(0.5)
+    except DebugLinkError as e:
+        print(f"rfoundry_debug: {e}", file=sys.stderr)
+        return 1 if e.status is not None else 2
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

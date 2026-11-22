@@ -1,0 +1,472 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 The RadioFoundry Authors
+/*
+ * Motorola LRRP (Location Request / Response Protocol, UDP 4001), the radio's side, see dmrLrrp.h
+ */
+
+#include <string.h>
+#include "dmr/dmrLrrp.h"
+#include "dmr/call/dmr_lc.h"
+
+// Document IDs: requests come with or without a constant data table (even / odd), the answers are sent without
+#define DOC_IMMEDIATE_RESPONSE		0x07
+#define DOC_START_RESPONSE			0x0B
+#define DOC_TRIGGERED_REPORT		0x0D
+#define DOC_STOP_RESPONSE			0x11
+
+// Tokens, requests
+#define TOK_REQUEST_ID				0x22	// length, bytes
+#define TOK_REQUEST_ID_1			0x23	// one byte
+#define TOK_REQUEST_ID_INT			0x24	// uintvar
+#define TOK_INTERVAL				0x31
+#define TOK_ONESHOT					0x33
+#define TOK_PERIODIC				0x34
+#define TOK_PROTOCOL_VERSION		0x3F
+#define TOK_MAX_INFO_AGE			0x42
+#define TOK_TRG_CONDITION			0x4A
+#define TOK_DISTANCE				0x78
+#define TRG_CONDITION_EMERGENCY		0x02
+
+// Tokens, answers
+#define TOK_INFO_TIME				0x34	// 5 octets
+#define TOK_RESULT					0x37	// uintvar
+#define TOK_RESULT_OK				0x38
+#define TOK_POSITION_RADIUS			0x51	// lat, lon, radius (ufloatvar)
+#define TOK_DIRECTION				0x56	// one octet, degrees / 2
+#define TOK_SPEED_HOR				0x6C	// ufloatvar, m/s
+
+typedef struct
+{
+	const uint8_t *d;
+	int i;
+	int end;
+	bool error;
+} reader_t;
+
+static uint8_t readByte(reader_t *r)
+{
+	if (r->i >= r->end)
+	{
+		r->error = true;
+		return 0;
+	}
+	return r->d[r->i++];
+}
+
+static uint32_t readUintvar(reader_t *r)
+{
+	uint32_t v = 0;
+
+	for (int n = 0; n < 5; n++)
+	{
+		uint8_t b = readByte(r);
+
+		v = (v << 7) | (b & 0x7F);
+		if (!(b & 0x80))
+		{
+			return v;
+		}
+	}
+
+	r->error = true;
+	return 0;
+}
+
+static void skipUfloatvar(reader_t *r)
+{
+	readUintvar(r);
+	readUintvar(r);
+}
+
+static int putUintvar(uint8_t *out, uint32_t v)
+{
+	uint8_t tmp[5];
+	int n = 0;
+
+	do
+	{
+		tmp[n++] = v & 0x7F;
+		v >>= 7;
+	} while (v != 0);
+
+	for (int i = 0; i < n; i++)
+	{
+		out[i] = tmp[n - 1 - i] | ((i < (n - 1)) ? 0x80 : 0x00);
+	}
+
+	return n;
+}
+
+bool lrrpDecodeRequest(const uint8_t *payload, int length, lrrpRequest_t *request)
+{
+	reader_t r = { .d = payload, .i = 0, .end = length, .error = false };
+
+	memset(request, 0, sizeof(*request));
+
+	uint32_t docId = readUintvar(&r);
+	uint32_t docLength = readUintvar(&r);
+
+	if (r.error)
+	{
+		return false;
+	}
+
+	// A document shorter than the datagram ends there; a longer one (cut in transit) at the datagram's end. Compared
+	// unsigned: a length near 2^32 must not wrap
+	if (docLength < (uint32_t)(r.end - r.i))
+	{
+		r.end = r.i + (int)docLength;
+	}
+
+	switch (docId)
+	{
+		case 0x04:
+		case 0x05:
+			request->type = LRRP_REQUEST_IMMEDIATE;
+			break;
+		case 0x08:
+		case 0x09:
+			request->type = LRRP_REQUEST_TRIGGERED_START;
+			break;
+		case 0x0E:
+		case 0x0F:
+			request->type = LRRP_REQUEST_TRIGGERED_STOP;
+			break;
+		case 0x14:
+			request->type = LRRP_REQUEST_PROTOCOL;
+			break;
+		default:
+			return false;// an answer, or something else
+	}
+
+	while ((r.i < r.end) && !r.error)
+	{
+		uint32_t tok = readUintvar(&r);
+
+		switch (tok)
+		{
+			case TOK_REQUEST_ID:
+				{
+					uint32_t n = readUintvar(&r);
+
+					if ((n == 0) || (n > LRRP_REQUEST_ID_MAX) || ((r.i + (int)n) > r.end))
+					{
+						return false;
+					}
+					memcpy(request->requestId, &r.d[r.i], n);
+					request->requestIdLength = n;
+					r.i += n;
+				}
+				break;
+			case TOK_REQUEST_ID_1:
+				request->requestId[0] = readByte(&r);
+				request->requestIdLength = 1;
+				break;
+			case TOK_REQUEST_ID_INT:
+				{
+					// Kept as the octets of its value, big endian
+					uint32_t v = readUintvar(&r);
+
+					request->requestIdLength = 4;
+					request->requestId[0] = v >> 24;
+					request->requestId[1] = v >> 16;
+					request->requestId[2] = v >> 8;
+					request->requestId[3] = v;
+				}
+				break;
+			case 0x50:
+				request->wanted |= LRRP_WANT_ACCURACY;
+				break;
+			case 0x51:
+				request->wanted |= LRRP_WANT_ACCURACY | LRRP_WANT_TIME;
+				break;
+			case 0x52:
+				request->wanted |= LRRP_WANT_TIME;
+				break;
+			case 0x53:
+				break;
+			case 0x54:
+				request->wanted |= LRRP_WANT_ALTITUDE;
+				break;
+			case 0x57:
+				request->wanted |= LRRP_WANT_DIRECTION;
+				break;
+			case 0x62:
+				request->wanted |= LRRP_WANT_SPEED;
+				break;
+			case TOK_PERIODIC:
+				request->triggers |= LRRP_TRIGGER_PERIODIC;
+				break;
+			case TOK_ONESHOT:
+				request->triggers |= LRRP_TRIGGER_ONESHOT;
+				break;
+			case TOK_INTERVAL:
+				request->intervalSeconds = readUintvar(&r);
+				break;
+			case TOK_DISTANCE:
+				request->distanceMeters = readUintvar(&r);
+				request->triggers |= LRRP_TRIGGER_DISTANCE;
+				break;
+			case TOK_TRG_CONDITION:
+				if (readUintvar(&r) == TRG_CONDITION_EMERGENCY)
+				{
+					request->triggers |= LRRP_TRIGGER_EMERGENCY;
+				}
+				break;
+			case TOK_PROTOCOL_VERSION:
+			case TOK_MAX_INFO_AGE:
+			case 0x55:
+			case 0x5F:
+			case 0x67:
+			case 0x71:
+				readUintvar(&r);
+				break;
+			case 0x56:
+			case 0x60:
+			case 0x68:
+			case 0x72:
+				skipUfloatvar(&r);
+				break;
+			case 0x61:
+			case 0x73:
+				readByte(&r);
+				break;
+			case 0x64:
+			case 0x66:
+			case 0x69:
+			case 0x74:
+			case 0x76:
+				break;
+			default:
+				r.i = r.end;// a token we don't know: what came before is still used
+				break;
+		}
+	}
+
+	return !r.error && (request->requestIdLength > 0);
+}
+
+// The document around its tokens: ID, length, tokens
+static int finishDocument(uint8_t docId, const uint8_t *tokens, int tokensLength, uint8_t *out)
+{
+	int n = putUintvar(out, docId);
+
+	n += putUintvar(&out[n], tokensLength);
+	if ((n + tokensLength) > LRRP_MAX_DOCUMENT)
+	{
+		return 0;
+	}
+	memcpy(&out[n], tokens, tokensLength);
+
+	return n + tokensLength;
+}
+
+static int putRequestId(uint8_t *out, const uint8_t *requestId, int requestIdLength)
+{
+	int n = 0;
+
+	out[n++] = TOK_REQUEST_ID;
+	n += putUintvar(&out[n], requestIdLength);
+	memcpy(&out[n], requestId, requestIdLength);
+
+	return n + requestIdLength;
+}
+
+// A coordinate in 1e-7 degree, as dmr_gps_range takes it: minutes10000 / 600000 degree is minutes10000 * 50 / 3 in
+// 1e-7, rounded half up
+static int32_t e7Of(uint8_t degrees, uint32_t minutes10000, bool positive)
+{
+	int32_t v = (int32_t)(degrees * 10000000u + (minutes10000 * 50u + 1u) / 3u);
+
+	return positive ? v : -v;
+}
+
+// Info time, latitude / longitude with a radius, and speed and direction when asked for and known
+static int putPosition(uint8_t *out, uint8_t wanted, const lrrpPosition_t *position)
+{
+	const dmrDataLocation_t *loc = &position->location;
+	int n = 0;
+
+	if (position->utcYear != 0)
+	{
+		uint64_t t = ((uint64_t)position->utcYear << 26) | ((uint64_t)position->utcMonth << 22) | ((uint64_t)position->utcDay << 17) |
+				((uint64_t)loc->utcHours << 12) | ((uint64_t)loc->utcMinutes << 6) | loc->utcSeconds;
+
+		out[n++] = TOK_INFO_TIME;
+		for (int i = 4; i >= 0; i--)
+		{
+			out[n++] = (t >> (i * 8)) & 0xFF;
+		}
+	}
+
+	// Integer math, not double (the soft-float library costs about 2 KB of flash). A coordinate is N = degrees *
+	// 600000 + minutes10000 in units of 1/600000 degree, and its raw value is N * 2^k / 421875 rounded half up
+	// (lat: 2^31 per 90 degrees, 54e6 = 2^7 * 421875; lon: 2^32 per 360 degrees, 216e6 = 2^9 * 421875). The
+	// denominator is odd, so no quotient ends in exactly one half. Gives what the double formula gave for every
+	// degrees and minutes value, and saturates the same way past the range
+	uint64_t latN = (uint64_t)loc->latDegrees * 600000u + loc->latMinutes10000;
+	uint64_t lonN = (uint64_t)loc->lonDegrees * 600000u + loc->lonMinutes10000;
+	uint64_t latMag = ((latN << 25) + 421875u) / (2u * 421875u);
+	uint64_t lonMag = ((lonN << 24) + 421875u) / (2u * 421875u);
+	uint32_t latRaw = latMag > 0x7FFFFFFFu ? 0x7FFFFFFFu : (uint32_t)latMag;
+	int32_t lonRaw;
+
+	if (loc->east)
+	{
+		lonRaw = lonMag > 0x7FFFFFFFu ? INT32_MAX : (int32_t)lonMag;
+	}
+	else
+	{
+		lonRaw = lonMag > 0x80000000u ? INT32_MIN : (int32_t)-(int64_t)lonMag;
+	}
+	if (!loc->north && latN != 0)
+	{
+		latRaw |= 0x80000000;
+	}
+
+	out[n++] = TOK_POSITION_RADIUS;
+	for (int i = 3; i >= 0; i--)
+	{
+		out[n++] = (latRaw >> (i * 8)) & 0xFF;
+	}
+	for (int i = 3; i >= 0; i--)
+	{
+		out[n++] = ((uint32_t)lonRaw >> (i * 8)) & 0xFF;
+	}
+	n += putUintvar(&out[n], 10);// radius: 10 m (no HDOP kept), no fraction
+	out[n++] = 0x00;
+
+	if ((wanted & LRRP_WANT_SPEED) && (loc->speedKnots != DMR_LOCATION_SPEED_UNKNOWN))
+	{
+		uint32_t mps128 = (uint32_t)(((uint64_t)loc->speedKnots * 65848832u + 500000u) / 1000000u);// m/s in 1/128: knots * 0.514444 * 128, rounded
+
+		out[n++] = TOK_SPEED_HOR;
+		n += putUintvar(&out[n], mps128 >> 7);
+		out[n++] = mps128 & 0x7F;
+	}
+
+	if ((wanted & LRRP_WANT_DIRECTION) && position->hasCourse)
+	{
+		out[n++] = TOK_DIRECTION;
+		out[n++] = (position->courseDegrees % 360) / 2;
+	}
+
+	return n;
+}
+
+int lrrpBuildImmediateResponse(const lrrpRequest_t *request, const lrrpPosition_t *position, uint8_t *out)
+{
+	uint8_t tokens[LRRP_MAX_DOCUMENT];
+	int n = putRequestId(tokens, request->requestId, request->requestIdLength);
+
+	if ((position == NULL) || !position->location.fixValid)
+	{
+		tokens[n++] = TOK_RESULT;
+		n += putUintvar(&tokens[n], LRRP_RESULT_NO_FIX);
+	}
+
+	if (position != NULL)
+	{
+		n += putPosition(&tokens[n], request->wanted, position);// the last known one, also without a fix
+	}
+
+	return finishDocument(DOC_IMMEDIATE_RESPONSE, tokens, n, out);
+}
+
+int lrrpBuildTriggeredStartResponse(const uint8_t *requestId, int requestIdLength, uint32_t result, uint8_t *out)
+{
+	uint8_t tokens[LRRP_MAX_DOCUMENT];
+	int n = putRequestId(tokens, requestId, requestIdLength);
+
+	if (result == LRRP_RESULT_SUCCESS)
+	{
+		tokens[n++] = TOK_RESULT_OK;
+	}
+	else
+	{
+		tokens[n++] = TOK_RESULT;
+		n += putUintvar(&tokens[n], result);
+	}
+
+	return finishDocument(DOC_START_RESPONSE, tokens, n, out);
+}
+
+int lrrpBuildTriggeredReport(const uint8_t *requestId, int requestIdLength, uint8_t wanted, const lrrpPosition_t *position, uint8_t *out)
+{
+	uint8_t tokens[LRRP_MAX_DOCUMENT];
+	int n = putRequestId(tokens, requestId, requestIdLength);
+
+	if (!position->location.fixValid)
+	{
+		tokens[n++] = TOK_RESULT;
+		n += putUintvar(&tokens[n], LRRP_RESULT_NO_FIX);
+	}
+	n += putPosition(&tokens[n], wanted, position);
+
+	return finishDocument(DOC_TRIGGERED_REPORT, tokens, n, out);
+}
+
+int lrrpBuildTriggeredStopResponse(const uint8_t *requestId, int requestIdLength, uint8_t *out)
+{
+	uint8_t tokens[LRRP_MAX_DOCUMENT];
+	int n = putRequestId(tokens, requestId, requestIdLength);
+
+	tokens[n++] = TOK_RESULT_OK;
+
+	return finishDocument(DOC_STOP_RESPONSE, tokens, n, out);
+}
+
+uint32_t lrrpDistanceMeters(const dmrDataLocation_t *a, const dmrDataLocation_t *b)
+{
+	// dmr_gps_range's single-precision math: double cos and sqrt cost about 8 KB of flash (libm and the soft-float
+	// library) on a build without LTO to drop them
+	uint32_t meters;
+	uint16_t bearing;
+
+	dmr_gps_range(e7Of(a->latDegrees, a->latMinutes10000, a->north), e7Of(a->lonDegrees, a->lonMinutes10000, a->east),
+			e7Of(b->latDegrees, b->latMinutes10000, b->north), e7Of(b->lonDegrees, b->lonMinutes10000, b->east),
+			&meters, &bearing);
+	return meters;
+}
+
+static uint32_t minutesOf(uint32_t e7)
+{
+	uint32_t m = (e7 % 10000000u * 60u + 500u) / 1000u;
+	return m < 600000u ? m : 599999u;
+}
+
+void lrrpPositionFromE7(int32_t lat, int32_t lon, uint16_t speedKnots, uint16_t course, uint32_t utcHms, uint32_t date,
+		lrrpPosition_t *out)
+{
+	dmrDataLocation_t *l = &out->location;
+	uint32_t la = lat < 0 ? 0u - (uint32_t)lat : (uint32_t)lat;
+	uint32_t lo = lon < 0 ? 0u - (uint32_t)lon : (uint32_t)lon;
+
+	memset(out, 0, sizeof(*out));
+	l->fixValid = true;
+	l->north = lat >= 0;
+	l->east = lon >= 0;
+	l->latDegrees = (uint8_t)(la / 10000000u);
+	l->lonDegrees = (uint8_t)(lo / 10000000u);
+	// 1e-7 degree -> 1e-4 minute: x 60 / 1000 rounded (under 6e8: 32 bits do), at most 59.9999
+	l->latMinutes10000 = minutesOf(la);
+	l->lonMinutes10000 = minutesOf(lo);
+	l->speedKnots = speedKnots < DMR_LOCATION_SPEED_UNKNOWN ? speedKnots : DMR_LOCATION_SPEED_UNKNOWN;
+	if (utcHms != 0xFFFFFFFFu)
+	{
+		l->utcHours = (uint8_t)(utcHms / 10000u);
+		l->utcMinutes = (uint8_t)(utcHms / 100u % 100u);
+		l->utcSeconds = (uint8_t)(utcHms % 100u);
+		if (date != 0)
+		{
+			out->utcDay = (uint8_t)(date / 10000u);
+			out->utcMonth = (uint8_t)(date / 100u % 100u);
+			out->utcYear = (uint16_t)(2000u + date % 100u);
+		}
+	}
+	if (course != 0xFFFFu)
+	{
+		out->hasCourse = true;
+		out->courseDegrees = course;
+	}
+}

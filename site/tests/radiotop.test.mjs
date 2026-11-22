@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 The RadioFoundry Authors
+// The keys to hold for update mode on the radio's picture (radiotop.js): which keys, where the marks go, and the
+// caption that names them. Every board's data is checked in site/tests/radio_images_test.py (each key to hold is a key
+// of the radio, on its drawing or listed undrawn, with a label here).
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+
+import { holdKeys, keyLabel, holdCaption, keyMarks } from "../static/js/flasher/radiotop.js";
+
+const en = JSON.parse(readFileSync(new URL("../i18n/en.json", import.meta.url), "utf8"));
+const tr = (key, fmt = {}) => (en[key] || key).replace(/\{(\w+)\}/g, (_, k) => (k in fmt ? fmt[k] : `{${k}}`));
+
+test("the keys to hold come from the radio's data", () => {
+	assert.deepEqual(holdKeys({ flash: { bootloader_hold: ["ptt", "sk1"] } }), ["ptt", "sk1"]);
+	assert.deepEqual(holdKeys({ flash: {} }), []);
+	assert.deepEqual(holdKeys(null), []);
+});
+
+test("the caption names the keys by their labels, in a list", () => {
+	assert.equal(holdCaption(["ptt", "sk1"], tr, "en"), "Hold PTT and SK1");
+	assert.equal(holdCaption(["p1"], tr, "en"), "Hold P1");
+	assert.equal(holdCaption(["ptt", "sk1", "p1"], tr, "en"), "Hold PTT, SK1, and P1");
+	assert.equal(holdCaption([], tr, "en"), "");
+	// a key without a label of its own reads as its name in capitals
+	assert.equal(keyLabel("vfo_mr", tr), "VFO_MR");
+	assert.equal(keyLabel("ptt", tr), "PTT");
+});
+
+test("a mark for each key the picture shows, where the data puts it", () => {
+	const radio = { frame_geometry: { keys: { ptt: { left: 3.3, top: 58.4, width: 3.9, height: 8.5 }, up: { left: 30, top: 80, width: 10, height: 3 } } } };
+	// sk1 isn't drawn (a front view): no mark, the caption names it
+	assert.deepEqual(keyMarks(radio, ["ptt", "sk1"]), [{ name: "ptt", left: 3.3, top: 58.4, width: 3.9, height: 8.5 }]);
+	assert.deepEqual(keyMarks({}, ["ptt"]), []);
+	assert.deepEqual(keyMarks(radio, []), []);
+});
+
+// The pages need the DOM, so what they must keep is checked in their source: every list of bootloader steps sits beside
+// the picture with the keys to hold marked
+test("every update mode step list marks the keys to hold", () => {
+	const app = readFileSync(new URL("../static/js/flasher/app.js", import.meta.url), "utf8");
+	assert.match(app, /function withPicture\(steps\) \{\n\tconst pic = radioPicture\(S\.radio, \{ keys: holdKeys\(S\.radio\) \}\);/);
+	const iap = readFileSync(new URL("../static/js/flasher/iapui.js", import.meta.url), "utf8");
+	assert.match(iap, /radioPicture\(S\(\)\.radio, \{ keys: holdKeys\(S\(\)\.radio\) \}\)/);
+	const lists = [...iap.matchAll(/\.\.\.steps\.map\(/g)].length;
+	assert.ok(lists >= 1);
+	assert.equal([...iap.matchAll(/withPicture\(h\("ol", \{ class: "steps[^"]*" \},[^\n]*\.\.\.steps\.map\(/g)].length, lists);
+});
+
+// A radio without a display (board.toml display = "none"): the caption has no screen line, no shot goes over the
+// picture, and the connect step doesn't describe a screen
+test("the picture's shape goes to the stylesheet, which limits its height; none without the data", async () => {
+	const { shapeStyle } = await import("../static/js/flasher/radiotop.js");
+	assert.equal(shapeStyle({ frame_geometry: { aspect: 0.37795 } }), "--rt-aspect:0.37795");
+	assert.equal(shapeStyle({ frame_geometry: {} }), "");
+	assert.equal(shapeStyle(null), "");
+	// site.css: the height limit and the width that follows from the shape, with the px max-width the build reads
+	const css = (await import("node:fs")).readFileSync(new URL("../static/css/site.css", import.meta.url), "utf8");
+	assert.match(css, /\.rt-pic \{ --rt-h: \d+px;[^}]*width: calc\(var\(--rt-h\) \* var\(--rt-aspect, 1\)\); max-width: \d+px;/);
+});
+
+test("a radio without a display gets no screen line", async () => {
+	const { hasNoScreen } = await import("../static/js/flasher/radiotop.js");
+	assert.equal(hasNoScreen({ display: "none" }), true);
+	assert.equal(hasNoScreen({ display: "128x64 mono" }), false);
+	assert.equal(hasNoScreen(null), false);
+	const top = readFileSync(new URL("../static/js/flasher/radiotop.js", import.meta.url), "utf8");
+	assert.match(top, /const noScreen = hasNoScreen\(radio\);/);
+	assert.match(top, /const url = noScreen \? null : screenShot\(radio, sc\);/);
+	assert.match(top, /sc === "any" \|\| noScreen \? null : t\(`flash\.c7\.visual\.screen_\$\{sc\}`\)/);
+	const ui = readFileSync(new URL("../static/js/flasher/c7000ui.js", import.meta.url), "utf8");
+	assert.match(ui, /const noScreen = \(\) => hasNoScreen\(S\(\)\.radio\);/);
+	const app = readFileSync(new URL("../static/js/flasher/app.js", import.meta.url), "utf8");
+	assert.match(app, /const noScreen = \(\) => hasNoScreen\(S\.radio\);/);
+	assert.match(ui, /noScreen\(\) \? "flash\.c7\.connect\.no_keys_dark" : "flash\.c7\.connect\.no_keys"/);
+	for (const [k, v] of Object.entries(en)) if (k.includes("_noscreen")) assert.ok(!/screen|display/i.test(v), `${k} names a screen`);
+	assert.ok(en["flash.c7.connect.no_keys_dark"] && !/screen/i.test(en["flash.c7.connect.no_keys_dark"]));
+});

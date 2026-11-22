@@ -1,0 +1,3749 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 The RadioFoundry Authors
+// The DMR voice call stack (core/dmr/call) against a simulated modem (sim/dmr_sim_modem.c), plus its link control
+// coding checked against references written here from the ETSI TS 102 361-1 definitions and against the older
+// clean-tree checkers (sfr.c's RS(12,9) / CRC check, dmrData.c's CSBK builder)
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "dmr/call/dmr_call.h"
+#include "dmr/call/dmr_lc.h"
+#include "dmr/sfr.h"
+#include "dmr/dmrData.h"
+#include "sim/dmr_sim_modem.h"
+#include "dmr/dmrPrivacy.h"
+#include "dmr/ambe/ambeFec.h"
+#include "dmr/fec/dmrFec.h"
+#include "config.h"
+#if CONFIG_AIR_AES
+#include "dmr/dmrAes.h"
+#endif
+
+static int failures;
+static int checks;
+#define CHECK(c) do { checks++; if (!(c)) { failures++; printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
+
+#define OWN_ID	9997040u
+#define TG_TALK	91u
+#define TG_LIST	3100u
+
+// ---------------------------------------------------------------------------------------------------------------
+// References, written from the definitions in a different form than core/dmr/call/dmr_lc.c
+
+static uint8_t ref_gf_mul(uint8_t a, uint8_t b)
+{
+	unsigned r = 0;
+
+	for (int i = 0; i < 8; i++)
+		if (b & (1 << i))
+			r ^= (unsigned)a << i;
+	for (int i = 15; i >= 8; i--)	// reduce by x^8 + x^4 + x^3 + x^2 + 1
+		if (r & (1u << i))
+			r ^= 0x11Du << (i - 8);
+	return (uint8_t)r;
+}
+
+static uint8_t ref_gf_pow2(int n)
+{
+	uint8_t r = 1;
+
+	while (n-- > 0)
+		r = ref_gf_mul(r, 2);
+	return r;
+}
+
+// Codeword c(x) = sum c[k] x^(11-k); evaluate at a^j
+static uint8_t ref_rs_eval(const uint8_t c[12], int j)
+{
+	uint8_t acc = 0;
+
+	for (int k = 0; k < 12; k++)
+		acc ^= ref_gf_mul(c[k], ref_gf_pow2(j * (11 - k)));
+	return acc;
+}
+
+// Parity by long division by g(x) = (x + a)(x + a^2)(x + a^3), g built from its roots
+static void ref_rs_parity(const uint8_t d[9], uint8_t p[3])
+{
+	uint8_t g[4] = { 1, 0, 0, 0 };	// g[i] coefficient of x^i
+
+	for (int r = 1; r <= 3; r++) {
+		uint8_t root = ref_gf_pow2(r);
+
+		for (int i = 3; i > 0; i--)
+			g[i] = g[i - 1] ^ ref_gf_mul(g[i], root);
+		g[0] = ref_gf_mul(g[0], root);
+	}
+	uint8_t w[12] = { 0 };
+	memcpy(w, d, 9);
+	for (int i = 0; i < 9; i++) {
+		uint8_t q = w[i];
+
+		for (int j = 0; j <= 3; j++)
+			w[i + j] ^= ref_gf_mul(q, g[3 - j]);
+	}
+	memcpy(p, &w[9], 3);
+}
+
+static int lcbit(const uint8_t *b, int i)
+{
+	return (b[i / 8] >> (7 - i % 8)) & 1;
+}
+
+// Embedded LC: matrix M[8][16], Hamming(16,11,4) parity equations written out, column parity, read column by column
+static void ref_emb_encode(const uint8_t lc[9], uint8_t air[128])
+{
+	uint8_t M[8][16];
+	unsigned sum = 0;
+	int n = 0;
+
+	memset(M, 0, sizeof(M));
+	for (int i = 0; i < 9; i++)
+		sum += lc[i];
+	uint8_t cs = (uint8_t)(sum % 31);
+
+	for (int r = 0; r < 7; r++) {
+		for (int c = 0; c < (r < 2 ? 11 : 10); c++)
+			M[r][c] = (uint8_t)lcbit(lc, n++);
+		if (r >= 2)
+			M[r][10] = (cs >> (4 - (r - 2))) & 1;
+		uint8_t *d = M[r];
+		M[r][11] = d[0] ^ d[1] ^ d[2] ^ d[3] ^ d[5] ^ d[7] ^ d[8];
+		M[r][12] = d[1] ^ d[2] ^ d[3] ^ d[4] ^ d[6] ^ d[8] ^ d[9];
+		M[r][13] = d[2] ^ d[3] ^ d[4] ^ d[5] ^ d[7] ^ d[9] ^ d[10];
+		M[r][14] = d[0] ^ d[1] ^ d[2] ^ d[4] ^ d[6] ^ d[7] ^ d[10];
+		M[r][15] = d[0] ^ d[2] ^ d[5] ^ d[6] ^ d[8] ^ d[9] ^ d[10];
+	}
+	for (int c = 0; c < 16; c++)
+		for (int r = 0; r < 7; r++)
+			M[7][c] ^= M[r][c];
+	n = 0;
+	for (int c = 0; c < 16; c++)
+		for (int r = 0; r < 8; r++)
+			air[n++] = M[r][c];
+}
+
+// Decode without error correction: true if every check holds
+static bool ref_emb_decode(const uint8_t bits[16], uint8_t lc[9])
+{
+	uint8_t air[128], M[8][16], again[128];
+	int n = 0;
+
+	for (int i = 0; i < 128; i++)
+		air[i] = (uint8_t)lcbit(bits, i);
+	for (int c = 0; c < 16; c++)
+		for (int r = 0; r < 8; r++)
+			M[r][c] = air[n++];
+	memset(lc, 0, 9);
+	n = 0;
+	for (int r = 0; r < 7; r++)
+		for (int c = 0; c < (r < 2 ? 11 : 10); c++, n++)
+			if (M[r][c])
+				lc[n / 8] |= (uint8_t)(0x80 >> (n % 8));
+	ref_emb_encode(lc, again);
+	return memcmp(air, again, 128) == 0;
+}
+
+static void pack_bits(const uint8_t air[128], uint8_t out[16])
+{
+	memset(out, 0, 16);
+	for (int i = 0; i < 128; i++)
+		if (air[i])
+			out[i / 8] |= (uint8_t)(0x80 >> (i % 8));
+}
+
+static void mk_lc(uint8_t lc[9], uint8_t flco, uint32_t dst, uint32_t src)
+{
+	dmr_lc_t l = { .flco = flco, .dst = dst, .src = src };
+
+	dmr_lc_pack(&l, lc);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Coding tests
+
+static void test_lc_pack(void)
+{
+	dmr_lc_t l = { .pf = true, .flco = 3, .fid = 0x10, .svc = 0xC1, .dst = 0x123456, .src = 0xABCDEF }, u;
+	uint8_t b[9];
+
+	dmr_lc_pack(&l, b);
+	CHECK(b[0] == 0x83 && b[1] == 0x10 && b[2] == 0xC1 && b[3] == 0x12 && b[5] == 0x56 && b[6] == 0xAB && b[8] == 0xEF);
+	dmr_lc_unpack(b, &u);
+	CHECK(u.pf && u.flco == 3 && u.fid == 0x10 && u.svc == 0xC1 && u.dst == 0x123456 && u.src == 0xABCDEF);
+	CHECK(dmr_lc_is_voice(b));
+	b[0] = 0x04;
+	CHECK(!dmr_lc_is_voice(b));
+}
+
+static void test_rs129(void)
+{
+	uint8_t zero[9] = { 0 }, full[12], lc[9];
+
+	// Known values: the all-zero LC has zero parity, so the header / terminator carry the bare masks
+	dmr_lc_encode_full(zero, DMR_RS_MASK_VOICE_HEADER, full);
+	CHECK(full[9] == 0x96 && full[10] == 0x96 && full[11] == 0x96);
+	dmr_lc_encode_full(zero, DMR_RS_MASK_TERMINATOR, full);
+	CHECK(full[9] == 0x99 && full[10] == 0x99 && full[11] == 0x99);
+
+	// Group voice TG 9 from 9997030 (the example LC of sfrTest), and random LCs: parity equal to the long-division
+	// reference, syndromes zero, accepted by sfr.c's independent checker with the right mask only
+	srand(12345);
+	for (int n = 0; n < 300; n++) {
+		uint8_t d[9] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x98, 0x8A, 0xE6 }, p[3], q[3];
+
+		if (n)
+			for (int i = 0; i < 9; i++)
+				d[i] = (uint8_t)rand();
+		dmr_rs129_parity(d, p);
+		ref_rs_parity(d, q);
+		CHECK(memcmp(p, q, 3) == 0);
+
+		uint8_t cw[12];
+		memcpy(cw, d, 9);
+		memcpy(&cw[9], p, 3);
+		CHECK(ref_rs_eval(cw, 1) == 0 && ref_rs_eval(cw, 2) == 0 && ref_rs_eval(cw, 3) == 0);
+
+		dmr_lc_encode_full(d, DMR_RS_MASK_VOICE_HEADER, full);
+		CHECK(sfrDataBurstCrcOk(DMR_TYPE_VOICE_LC_HEADER, full));
+		CHECK(dmr_lc_decode_full(full, DMR_RS_MASK_VOICE_HEADER, lc) == 0 && memcmp(lc, d, 9) == 0);
+		CHECK(dmr_lc_decode_full(full, DMR_RS_MASK_TERMINATOR, lc) != 0);	// header isn't a terminator
+
+		// Any one octet wrong (data or parity) is corrected
+		int pos = n % 12;
+		uint8_t bad[12];
+		memcpy(bad, full, 12);
+		bad[pos] ^= (uint8_t)(1 + rand() % 255);
+		CHECK(dmr_lc_decode_full(bad, DMR_RS_MASK_VOICE_HEADER, lc) == 1 && memcmp(lc, d, 9) == 0);
+		// Two octets wrong are detected, never miscorrected (distance 4)
+		bad[(pos + 5) % 12] ^= (uint8_t)(1 + rand() % 255);
+		CHECK(dmr_lc_decode_full(bad, DMR_RS_MASK_VOICE_HEADER, lc) == -1);
+
+		dmr_lc_encode_full(d, DMR_RS_MASK_TERMINATOR, full);
+		CHECK(sfrDataBurstCrcOk(DMR_TYPE_TERMINATOR_LC, full));
+		CHECK(dmr_lc_decode_full(full, DMR_RS_MASK_TERMINATOR, lc) == 0);
+	}
+}
+
+static void test_csbk(void)
+{
+	uint8_t mine[12], ten[10] = { 0xB8, 0, 0, 0, 0, 0, 0, 0x98, 0x8A, 0xF0 };	// from 9997040 = 0x988AF0
+	dmrBurst_t ref;
+
+	dmr_csbk_bs_activation(OWN_ID, mine);
+	CHECK(memcmp(mine, ten, 10) == 0);
+	CHECK(dmrDataBuildCSBK(ten, &ref) > 0);
+	CHECK(memcmp(mine, ref.payload, 12) == 0);	// same CRC as the data service's builder
+	CHECK(sfrDataBurstCrcOk(DMR_TYPE_CSBK, mine));
+}
+
+static void test_embedded(void)
+{
+	uint8_t lc[9], bits[16], air[128], refbits[16], out[9], frag[4][4];
+
+	// Checksum: sum of octets mod 31
+	mk_lc(lc, 0, 9, 1);
+	CHECK(dmr_emb_lc_checksum(lc) == 10);
+	memset(lc, 0xFF, 9);
+	CHECK(dmr_emb_lc_checksum(lc) == (9 * 255) % 31);
+	// The all-zero LC is the all-zero embedded signaling (linear code, zero checksum)
+	memset(lc, 0, 9);
+	dmr_emb_lc_encode_bits(lc, bits);
+	for (int i = 0; i < 16; i++)
+		CHECK(bits[i] == 0);
+
+	srand(777);
+	for (int n = 0; n < 300; n++) {
+		for (int i = 0; i < 9; i++)
+			lc[i] = (uint8_t)rand();
+		dmr_emb_lc_encode_bits(lc, bits);
+		ref_emb_encode(lc, air);
+		pack_bits(air, refbits);
+		CHECK(memcmp(bits, refbits, 16) == 0);
+		CHECK(ref_emb_decode(bits, out) && memcmp(out, lc, 9) == 0);
+		CHECK(dmr_emb_lc_decode_bits(bits, out) && memcmp(out, lc, 9) == 0);
+
+		// One bit error anywhere is corrected
+		uint8_t bad[16];
+		int e = n % 128;
+		memcpy(bad, bits, 16);
+		bad[e / 8] ^= (uint8_t)(0x80 >> (e % 8));
+		CHECK(dmr_emb_lc_decode_bits(bad, out) && memcmp(out, lc, 9) == 0);
+		// Two errors in one row (air bits 8 apart are one row, adjacent columns) are refused
+		int e2 = (e + 8) % 128;
+		if (e % 8 != 7 && e2 != 127 && e != 127) {
+			bad[e2 / 8] ^= (uint8_t)(0x80 >> (e2 % 8));
+			CHECK(!dmr_emb_lc_decode_bits(bad, out));
+		}
+
+		// Fragments B-E are the 4 x 32 bits in order; the reassembler wants first, cont, cont, last
+		dmr_emb_lc_encode(lc, frag);
+		CHECK(memcmp(frag[0], bits, 4) == 0 && memcmp(frag[3], &bits[12], 4) == 0);
+		dmr_emb_rx_t rx;
+		dmr_emb_rx_reset(&rx);
+		CHECK(!dmr_emb_rx_push(&rx, frag[0], DMR_LCSS_FIRST, out));
+		CHECK(!dmr_emb_rx_push(&rx, frag[1], DMR_LCSS_CONTINUATION, out));
+		CHECK(!dmr_emb_rx_push(&rx, frag[2], DMR_LCSS_CONTINUATION, out));
+		memset(out, 0, 9);
+		CHECK(dmr_emb_rx_push(&rx, frag[3], DMR_LCSS_LAST, out) && memcmp(out, lc, 9) == 0);
+		// A missing continuation spoils it
+		CHECK(!dmr_emb_rx_push(&rx, frag[0], DMR_LCSS_FIRST, out));
+		CHECK(!dmr_emb_rx_push(&rx, frag[1], DMR_LCSS_CONTINUATION, out));
+		CHECK(!dmr_emb_rx_push(&rx, frag[3], DMR_LCSS_LAST, out));
+	}
+	CHECK(dmr_emb_lcss(0) == 0 && dmr_emb_lcss(1) == 1 && dmr_emb_lcss(2) == 3 && dmr_emb_lcss(3) == 3 &&
+	      dmr_emb_lcss(4) == 2 && dmr_emb_lcss(5) == 0);
+}
+
+// Talker alias LCs for a string: 8-bit format (header 6 characters, blocks 7) or 7-bit (7, 8)
+static int mk_alias(const char *text, int format, uint8_t lcs[4][9])
+{
+	int len = (int)strlen(text), width = format == DMR_TA_7BIT ? 7 : 8, start = format == DMR_TA_7BIT ? 0 : 1;
+	uint8_t stream[28] = { 0 };
+
+	for (int i = 0; i < len; i++)
+		for (int b = 0; b < width; b++)
+			if ((text[i] >> (width - 1 - b)) & 1) {
+				int at = start + i * width + b;
+				stream[at / 8] |= (uint8_t)(0x80 >> (at % 8));
+			}
+	int nbits = start + len * width, blocks = nbits <= 49 ? 0 : (nbits - 49 + 55) / 56;
+
+	memset(lcs, 0, 4 * 9);
+	lcs[0][0] = DMR_FLCO_TA_HEADER;
+	lcs[0][2] = (uint8_t)((format << 6) | (len << 1) | lcbit(stream, 0));
+	for (int i = 0; i < 48; i++)
+		if (lcbit(stream, 1 + i))
+			lcs[0][3 + i / 8] |= (uint8_t)(0x80 >> (i % 8));
+	for (int bl = 1; bl <= blocks; bl++) {
+		lcs[bl][0] = (uint8_t)(DMR_FLCO_TA_HEADER + bl);
+		for (int i = 0; i < 56; i++)
+			if (lcbit(stream, 49 + (bl - 1) * 56 + i))
+				lcs[bl][2 + i / 8] |= (uint8_t)(0x80 >> (i % 8));
+	}
+	return 1 + blocks;
+}
+
+static void test_alias(void)
+{
+	uint8_t lcs[4][9];
+	dmr_ta_t ta;
+	int n = mk_alias("Q0TEST Charlie", DMR_TA_ISO8, lcs);
+
+	CHECK(n == 3);
+	dmr_ta_reset(&ta);
+	CHECK(dmr_ta_push(&ta, lcs[0]));
+	CHECK(strcmp(ta.text, "Q0TEST") == 0 && !ta.complete);
+	CHECK(!dmr_ta_push(&ta, lcs[2]));	// block 2 before block 1: nothing new shows
+	CHECK(strcmp(ta.text, "Q0TEST") == 0);
+	CHECK(dmr_ta_push(&ta, lcs[1]));
+	CHECK(strcmp(ta.text, "Q0TEST Charlie") == 0 && ta.complete);
+	CHECK(!dmr_ta_push(&ta, lcs[1]));	// repeats change nothing
+
+	n = mk_alias("QD9XYZ Bob Smith Radio", DMR_TA_7BIT, lcs);
+	dmr_ta_reset(&ta);
+	for (int i = 0; i < n; i++)
+		dmr_ta_push(&ta, lcs[i]);
+	CHECK(strcmp(ta.text, "QD9XYZ Bob Smith Radio") == 0 && ta.complete);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Call stack harness
+
+static uint32_t now;
+static unsigned sub_ms;	// time into the current slot
+
+static struct {
+	unsigned begins, ends, frames, losts;
+	dmr_caller_t caller;
+	uint8_t first[9];
+	uint8_t last[9];
+	uint8_t seq[256];	// first octet of each frame played
+} sink_log;
+
+static void s_begin(const dmr_caller_t *c, void *ctx) { (void)ctx; sink_log.begins++; sink_log.caller = *c; }
+static void s_frame(const uint8_t f[9], void *ctx)
+{
+	(void)ctx;
+	if (sink_log.frames == 0)
+		memcpy(sink_log.first, f, 9);
+	memcpy(sink_log.last, f, 9);
+	if (sink_log.frames < sizeof(sink_log.seq))
+		sink_log.seq[sink_log.frames] = f[0];
+	sink_log.frames++;
+}
+static void s_lost(void *ctx) { (void)ctx; sink_log.losts++; }
+static void s_end(void *ctx) { (void)ctx; sink_log.ends++; }
+
+static const dmr_voice_sink_t sink = { .begin = s_begin, .frame = s_frame, .lost = s_lost, .end = s_end };
+
+// TX source: a frame every 20 ms of simulated time, numbered in octet 0 (and a fixed pattern after)
+static struct {
+	bool on;
+	uint32_t start_ms;
+	unsigned produced, taken, begins, ends;
+	bool starve;
+} src;
+
+static void src_begin(void *ctx) { (void)ctx; src.on = true; src.start_ms = now; src.produced = src.taken = 0; src.begins++; }
+static void src_end(void *ctx) { (void)ctx; src.on = false; src.ends++; }
+static bool src_next(uint8_t f[9], void *ctx)
+{
+	(void)ctx;
+	if (!src.on || src.starve)
+		return false;
+	unsigned avail = (now - src.start_ms) / 20 + 1;	// first frame 0 ms after begin
+	if (src.taken >= avail)
+		return false;
+	f[0] = (uint8_t)(src.taken + 1);
+	for (int i = 1; i < 9; i++)
+		f[i] = (uint8_t)(0xA0 + i);
+	src.taken++;
+	return true;
+}
+
+static const dmr_voice_source_t source = { .begin = src_begin, .next = src_next, .end = src_end };
+
+// 10 ms steps; a slot boundary every 30 ms; the stack polled every step
+static void run_ms(unsigned ms)
+{
+	for (unsigned t = 0; t < ms; t += 10) {
+		now += 10;
+		sub_ms += 10;
+		if (sub_ms >= 30) {
+			sub_ms = 0;
+			sim_slot();
+		}
+		dmr_call_poll(now);
+	}
+}
+
+static dmr_call_config_t base_cfg(void)
+{
+	static const uint32_t list[] = { TG_LIST, 9 };
+	dmr_call_config_t c;
+
+	dmr_call_config_default(&c);
+	c.own_id = OWN_ID;
+	c.cc = 1;
+	c.ts = 1;
+	c.talk_target.id = TG_TALK;
+	c.listen.groups = list;
+	c.listen.group_count = 2;
+	return c;
+}
+
+static const hal_dmr_modem_t *modem = &sim_modem;	// sim_modem_gaps for test_rmo_listen_gaps
+
+static void setup(const dmr_call_config_t *c)
+{
+	sim_reset();
+	memset(&sink_log, 0, sizeof(sink_log));
+	memset(&src, 0, sizeof(src));
+	now = 1000;
+	sub_ms = 0;
+	dmr_call_init(modem);
+	dmr_call_set_voice(&sink, &source);
+	dmr_call_configure(c);
+	CHECK(dmr_call_start());
+	dmr_call_poll(now);
+}
+
+static const dmr_call_view_t *V(void) { return dmr_call_view(); }
+
+// Received bursts as a driver reports them
+static void rx_header(const uint8_t lc[9], uint8_t cc, int8_t ts, uint8_t sync, bool terminator)
+{
+	dmr_burst_t b;
+
+	memset(&b, 0, sizeof(b));
+	b.kind = terminator ? DMR_BURST_TERMINATOR_LC : DMR_BURST_VOICE_LC_HEADER;
+	b.sync = sync;
+	b.cc = cc;
+	b.ts = ts;
+	b.crc_ok = true;
+	b.in_step = true;
+	b.len = 12;
+	dmr_lc_encode_full(lc, terminator ? DMR_RS_MASK_TERMINATOR : DMR_RS_MASK_VOICE_HEADER, b.payload);
+	sim_rx(&b);
+}
+
+// Voice burst; frames numbered from *frame; lc != NULL: the modem reports an assembled embedded LC with it
+static void rx_voice(uint8_t index, uint8_t cc, int8_t ts, uint8_t sync, unsigned *frame, const uint8_t *lc, bool pi)
+{
+	dmr_burst_t b;
+
+	memset(&b, 0, sizeof(b));
+	b.kind = DMR_BURST_VOICE;
+	b.voice_index = index;
+	b.sync = index == 0 ? sync : DMR_SYNC_NONE;
+	b.cc = cc;
+	b.ts = ts;
+	b.crc_ok = true;
+	b.pi = pi;
+	b.in_step = true;
+	b.rssi_dbm = -85;
+	b.len = 27;
+	for (int f = 0; f < 3; f++) {
+		b.payload[f * 9] = (uint8_t)((*frame)++);
+		memset(&b.payload[f * 9 + 1], 0x55, 8);
+	}
+	if (lc) {
+		b.lc_valid = true;
+		memcpy(b.lc, lc, 9);
+	}
+	sim_rx(&b);
+}
+
+// A call as heard: header (optional), superframes from burst `from`, embedded LC reported on each F, terminator
+static void rx_call(const uint8_t lc[9], uint8_t cc, bool header, int from, int superframes, bool term, unsigned *frame)
+{
+	if (header) {
+		for (int h = 0; h < 3; h++) {
+			rx_header(lc, cc, 0, DMR_SYNC_MS, false);
+			run_ms(60);
+		}
+	}
+	for (int sf = 0; sf < superframes; sf++)
+		for (int i = (sf == 0 ? from : 0); i < 6; i++) {
+			rx_voice((uint8_t)i, cc, 0, DMR_SYNC_MS, frame, i == 5 ? lc : NULL, false);
+			run_ms(60);
+		}
+	if (term) {
+		rx_header(lc, cc, 0, DMR_SYNC_MS, true);
+		run_ms(60);
+	}
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// TX
+
+static void check_tx_burst_sequence(unsigned first, uint8_t expect_lc[9], unsigned *voice_bursts)
+{
+	uint8_t full[12];
+	unsigned i = first, v = 0;
+
+	dmr_lc_encode_full(expect_lc, DMR_RS_MASK_VOICE_HEADER, full);
+	for (int h = 0; h < DMR_CALL_TX_HEADERS; h++, i++) {
+		CHECK(sim.air[i].kind == DMR_BURST_VOICE_LC_HEADER);
+		CHECK(sim.air[i].len == 12 && sim.air[i].host_crc && memcmp(sim.air[i].payload, full, 12) == 0);
+	}
+	// Voice straight after the headers (gotcha 1.1), A-F in order, B-E carrying the LC's fragments
+	dmr_emb_rx_t rx;
+	dmr_emb_rx_reset(&rx);
+	unsigned lcs = 0;
+	while (i < sim.air_count && sim.air[i].kind == DMR_BURST_VOICE) {
+		sim_air_t *a = &sim.air[i];
+		uint8_t out[9];
+
+		CHECK(a->voice_index == v % 6);
+		CHECK(a->len == 27 && !a->host_crc);
+		CHECK(a->lcss == dmr_emb_lcss(a->voice_index));
+		if (a->voice_index >= 1 && a->voice_index <= 4 && dmr_emb_rx_push(&rx, a->emb, a->lcss, out)) {
+			CHECK(memcmp(out, expect_lc, 9) == 0);
+			lcs++;
+		}
+		if (a->voice_index == 4) {	// all four fragments of this superframe: the reference decoder agrees
+			uint8_t bits[16], out2[9];
+
+			for (int k = 0; k < 4; k++)
+				memcpy(&bits[4 * k], sim.air[i - 3 + k].emb, 4);
+			CHECK(ref_emb_decode(bits, out2) && memcmp(out2, expect_lc, 9) == 0);
+		}
+		i++;
+		v++;
+	}
+	CHECK(v > 0 && v % 6 == 0);	// ends at a superframe boundary
+	CHECK(lcs == v / 6);
+	dmr_lc_encode_full(expect_lc, DMR_RS_MASK_TERMINATOR, full);
+	CHECK(i < sim.air_count && sim.air[i].kind == DMR_BURST_TERMINATOR_LC);
+	CHECK(sim.air[i].host_crc && memcmp(sim.air[i].payload, full, 12) == 0);
+	CHECK(i + 1 == sim.air_count);
+	*voice_bursts = v;
+}
+
+static void test_tx_call(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	unsigned v;
+
+	setup(&c);
+	CHECK(sim.started && sim.cc_filter == 1 && sim.locked_ts == 0);
+	dmr_call_ptt(true);
+	run_ms(10);
+	CHECK(V()->state == DMR_CALL_STATE_TX && V()->phase == DMR_CALL_PHASE_TX_VOICE);
+	CHECK(sim.tx_begins == 1 && sim.last_timing == DMR_TIMING_OWN && sim.last_ts == 1);
+	mk_lc(lc, DMR_FLCO_GROUP_VOICE, TG_TALK, OWN_ID);
+	CHECK(sim.emb_lc_set && memcmp(sim.emb_lc, lc, 9) == 0);
+	CHECK(V()->caller.src == OWN_ID && V()->caller.dst == TG_TALK && V()->caller.group);
+	CHECK(src.begins == 1);
+	run_ms(1000);
+	dmr_call_ptt(false);	// mid superframe
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE);	// finishing the superframe
+	run_ms(600);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE && V()->phase == DMR_CALL_PHASE_IDLE);
+	CHECK(sim.tx_ends == 1 && sim.tx_aborts == 0 && sim.underflows == 0);
+	CHECK(src.ends == 1);
+	check_tx_burst_sequence(0, lc, &v);
+	CHECK(v >= 18);
+	// Every encoded frame went out, in order, with silence only where the encoder had nothing yet
+	unsigned silent = 0, expect = 1;
+	for (unsigned i = DMR_CALL_TX_HEADERS; i < DMR_CALL_TX_HEADERS + v; i++)
+		for (int f = 0; f < 3; f++) {
+			const uint8_t *fr = &sim.air[i].payload[f * 9];
+			if (memcmp(fr, dmr_ambe_silence, 9) == 0) {
+				silent++;
+			} else {
+				CHECK(fr[0] == (uint8_t)expect);
+				expect++;
+			}
+		}
+	CHECK(silent == V()->tx_underruns);
+	CHECK(silent <= 3);
+	printf("# TX: %u headers, %u voice bursts, %u silence frames, 1 terminator\n", DMR_CALL_TX_HEADERS, v, silent);
+	// The talk target was the channel's: no reply countdown
+	CHECK(!V()->reply_active && V()->tx_target.id == TG_TALK);
+}
+
+static void test_tx_timeout_and_starve(void)
+{
+	dmr_call_config_t c = base_cfg();
+	unsigned v;
+	uint8_t lc[9];
+
+	c.tot_s = 1;
+	setup(&c);
+	src.starve = true;	// encoder never ready: all silence, but the burst train keeps going
+	dmr_call_ptt(true);
+	run_ms(2000);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_TIMEOUT);
+	CHECK(sim.underflows == 0);
+	mk_lc(lc, 0, TG_TALK, OWN_ID);
+	check_tx_burst_sequence(0, lc, &v);
+	CHECK(v == 18);	// 1 s: headers 180 ms, then voice up to the superframe boundary after the time-out
+	dmr_call_ptt(false);
+	run_ms(20);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+}
+
+// The reverse channel's cease (ETSI TS 102 361-4 6.4.15.2): heard twice within DMR_CALL_RC_CONFIRM_MS while our
+// voice goes out, the over ends after burst F with a terminator and PTT must be released. One alone, a bad CRC, a
+// power command or two too far apart don't stop it
+static void test_tx_rc_cease(void)
+{
+	dmr_call_config_t c = base_cfg();
+	dmr_call_stats_t st;
+	unsigned v;
+	uint8_t lc[9];
+
+	setup(&c);
+	dmr_call_reset_stats();
+	dmr_call_ptt(true);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE);
+	sim_rc(dmrFecRcInfo(DMR_RC_CEASE), 0);
+	run_ms(DMR_CALL_RC_CONFIRM_MS + 100);
+	sim_rc(dmrFecRcInfo(DMR_RC_CEASE), DMR_RC_EMBEDDED);	// too long after the first: counts as a first again
+	run_ms(300);
+	sim_rc((uint16_t)(dmrFecRcInfo(DMR_RC_CEASE) ^ 1u), DMR_RC_EMBEDDED);	// CRC fails
+	sim_rc(dmrFecRcInfo(DMR_RC_POWER_DOWN), 0);
+	run_ms(300);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE);
+	sim_rc(dmrFecRcInfo(DMR_RC_CEASE_REQUEST), DMR_RC_EMBEDDED);	// the second within the window
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE);	// finishing the superframe
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_CEASED);
+	mk_lc(lc, 0, TG_TALK, OWN_ID);
+	check_tx_burst_sequence(0, lc, &v);	// whole superframes, then the terminator with LC
+	dmr_call_get_stats(&st);
+	CHECK(st.rc_good == 4 && st.rc_bad == 1 && st.rc_ceased == 1 && st.rc_last == DMR_RC_CEASE_REQUEST);
+	dmr_call_ptt(false);
+	run_ms(20);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+	// The next over isn't stopped by the last one's
+	dmr_call_ptt(true);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE);
+	sim_rc(dmrFecRcInfo(DMR_RC_CEASE), 0);
+	run_ms(300);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE && V()->tx_error == DMR_TX_OK);
+}
+
+static void test_tx_refused(void)
+{
+	dmr_call_config_t c = base_cfg();
+
+	setup(&c);
+	sim.refuse_tx = true;
+	dmr_call_ptt(true);
+	run_ms(30);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_REJECTED);
+	dmr_call_ptt(false);
+	run_ms(30);
+	sim.refuse_tx = false;
+	// The modem's polite refusal during the call
+	dmr_call_ptt(true);
+	run_ms(100);
+	sim.reject_next = true;
+	run_ms(100);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_REJECTED);
+	CHECK(src.ends == 1);
+	dmr_call_ptt(false);
+	run_ms(30);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+}
+
+// The end of a transmission wakes the poll's owner (dmr_call_set_wake) with the event already queued: one poll at the
+// same time ends the call, without waiting for the next tick. Nothing else wakes it
+static unsigned wakes;
+static void on_wake(void) { wakes++; }
+
+static void test_tx_done_wake(void)
+{
+	dmr_call_config_t c = base_cfg();
+
+	setup(&c);
+	dmr_call_set_wake(on_wake);
+	wakes = 0;
+	dmr_call_ptt(true);
+	run_ms(500);
+	CHECK(V()->state == DMR_CALL_STATE_TX && wakes == 0);	// slot ticks, bursts, the start: no wake
+	dmr_call_ptt(false);
+	// The slots alone until the modem says it is done, polling as run_ms does until then
+	for (unsigned t = 0; t < 1000 && wakes == 0; t += 10) {
+		now += 10;
+		sub_ms += 10;
+		if (sub_ms >= 30) {
+			sub_ms = 0;
+			sim_slot();
+		}
+		if (wakes == 0)
+			dmr_call_poll(now);
+	}
+	CHECK(wakes == 1 && sim.tx_ends == 1);
+	CHECK(V()->state == DMR_CALL_STATE_TX);
+	dmr_call_poll(now);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE && V()->phase == DMR_CALL_PHASE_IDLE);
+	run_ms(300);
+	CHECK(wakes == 1);
+
+	// A refusal mid call wakes it too
+	dmr_call_ptt(true);
+	run_ms(100);
+	sim.reject_next = true;
+	run_ms(100);
+	CHECK(V()->tx_error == DMR_TX_ERR_REJECTED && wakes == 2);
+	dmr_call_ptt(false);
+	run_ms(30);
+	dmr_call_set_wake(NULL);
+}
+
+// A modem that takes the transmission but never sends a burst (no slot timing: a modem not answering).
+// The call must end on its own, PTT held or released, not wait for a superframe boundary that never comes
+static void test_tx_modem_stalled(void)
+{
+	dmr_call_config_t c = base_cfg();
+
+	// Stalled from the start, PTT held: refused once the modem has taken nothing for DMR_CALL_TX_STALL_MS
+	setup(&c);
+	sim.stalled = true;
+	dmr_call_ptt(true);
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && sim.tx_begins == 1);
+	run_ms(DMR_CALL_TX_STALL_MS - 100);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE);
+	run_ms(200);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_STALLED);
+	CHECK(sim.tx_aborts == 1 && sim.air_count == 0);
+	CHECK(src.begins == 1 && src.ends == 1);
+	dmr_call_ptt(false);
+	run_ms(20);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE && V()->state == DMR_CALL_STATE_IDLE);
+
+	// PTT released early (the terminator waits for a boundary that never comes): back to idle all the same
+	setup(&c);
+	sim.stalled = true;
+	dmr_call_ptt(true);
+	run_ms(300);
+	dmr_call_ptt(false);
+	run_ms(DMR_CALL_TX_STALL_MS);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE && V()->tx_error == DMR_TX_ERR_STALLED);
+	CHECK(sim.tx_aborts == 1 && src.ends == 1);
+
+	// The time-out has the same wait: it too ends the call on a stalled modem
+	c.tot_s = 1;
+	setup(&c);
+	sim.stalled = true;
+	dmr_call_ptt(true);
+	run_ms(DMR_CALL_TX_STALL_MS + 100);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED);
+	dmr_call_ptt(false);
+	run_ms(20);
+	c.tot_s = 0;
+
+	// A modem that stops mid-call; a working one is never cut, however long the call
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(3 * DMR_CALL_TX_STALL_MS);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && sim.tx_aborts == 0 && sim.air_count > 0);
+	sim.stalled = true;
+	run_ms(DMR_CALL_TX_STALL_MS + 100);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_STALLED && sim.tx_aborts == 1);
+	dmr_call_ptt(false);
+	run_ms(20);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+
+	// The next PTT on a modem that recovered is a normal call
+	sim.stalled = false;
+	dmr_call_ptt(true);
+	run_ms(500);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE && V()->tx_error == DMR_TX_OK && sim.tx_ends == 1);
+}
+
+static bool permit_busy_flag;
+static bool permit_busy(void) { return permit_busy_flag; }
+
+// Talk permit before keying (permit_hold_ms): the admitted call holds in its own phase, still receiving, until the
+// minimum has passed and permit_busy() is false, at most DMR_CALL_PERMIT_MAX_MS
+static void test_tx_permit_hold(void)
+{
+	dmr_call_config_t c = base_cfg();
+	c.permit_hold_ms = 40;
+	c.permit_busy = permit_busy;
+	setup(&c);
+	uint8_t seq = V()->permit_seq;
+	permit_busy_flag = true;
+	dmr_call_ptt(true);
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_PERMIT && V()->state == DMR_CALL_STATE_TX && sim.tx_begins == 0);
+	CHECK(V()->permit_seq == (uint8_t)(seq + 1));
+	run_ms(100);	// past the minimum, the beep still playing
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_PERMIT && sim.tx_begins == 0);
+	permit_busy_flag = false;
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && sim.tx_begins == 1);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+
+	// Busy for good: keys at the maximum
+	setup(&c);
+	permit_busy_flag = true;
+	dmr_call_ptt(true);
+	run_ms(DMR_CALL_PERMIT_MAX_MS - 20);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_PERMIT && sim.tx_begins == 0);
+	run_ms(40);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && sim.tx_begins == 1);
+	dmr_call_ptt(false);
+	run_ms(600);
+
+	// PTT released in the hold: nothing is sent
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_PERMIT);
+	dmr_call_ptt(false);
+	run_ms(100);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE && V()->state == DMR_CALL_STATE_IDLE && sim.tx_begins == 0);
+
+	// A call begins in the hold: refused as at PTT (no access wait), nothing sent
+	uint8_t lc[9];
+	unsigned frame = 1;
+	mk_lc(lc, 0, TG_LIST, 9997030);
+	setup(&c);
+	permit_busy_flag = true;
+	dmr_call_ptt(true);
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_PERMIT);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_BUSY && sim.tx_begins == 0);
+	dmr_call_ptt(false);
+	run_ms(600);
+	permit_busy_flag = false;
+
+	// With an access wait: back to access while the call runs, then a new permit and the key-up
+	c.access_wait_ms = 2000;
+	setup(&c);
+	seq = V()->permit_seq;
+	permit_busy_flag = true;
+	dmr_call_ptt(true);
+	run_ms(10);
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_ACCESS && V()->state == DMR_CALL_STATE_RX && sim.tx_begins == 0);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, true);
+	run_ms(20);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_PERMIT && V()->permit_seq == (uint8_t)(seq + 2) && sim.tx_begins == 0);
+	permit_busy_flag = false;
+	run_ms(50);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && sim.tx_begins == 1);
+	dmr_call_ptt(false);
+	run_ms(600);
+	c.access_wait_ms = 0;
+
+	// Through a repeater: the hold follows the wake-up, the permit plays only once the repeater answered
+	c.rmo = true;
+	c.ts = 2;
+	setup(&c);
+	sim.wake_repeater_on_csbk = true;
+	seq = V()->permit_seq;
+	permit_busy_flag = true;
+	dmr_call_ptt(true);
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_WAKEUP && V()->permit_seq == seq);
+	run_ms(400);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_PERMIT && V()->repeater_up && V()->permit_seq == (uint8_t)(seq + 1));
+	CHECK(sim.air_count == 1 && sim.air[0].kind == DMR_BURST_CSBK);
+	permit_busy_flag = false;
+	run_ms(50);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && sim.last_timing == DMR_TIMING_ALIGNED);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+
+	// A short press through a repeater: the wake-up goes on, no hold and nothing more sent once it answers
+	setup(&c);
+	sim.wake_repeater_on_csbk = true;
+	seq = V()->permit_seq;
+	dmr_call_ptt(true);
+	run_ms(10);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE && V()->permit_seq == seq && sim.air_count == 1);
+
+	// The repeater drops in the hold (it outlasts DMR_CALL_REPEATER_HOLD_MS): woken again, never keyed blind
+	setup(&c);
+	sim.repeater = true;
+	run_ms(180);
+	CHECK(V()->repeater_up);
+	permit_busy_flag = true;
+	dmr_call_ptt(true);
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_PERMIT && sim.tx_begins == 0);
+	sim.repeater = false;
+	run_ms(DMR_CALL_REPEATER_HOLD_MS + 40);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_WAKEUP && sim.air_count == 1 && sim.air[0].kind == DMR_BURST_CSBK);
+	permit_busy_flag = false;
+	dmr_call_ptt(false);
+	run_ms(3000);
+}
+
+static void test_rmo_air_slot_alignment(void)
+{
+	for (uint8_t ts = 1; ts <= 2; ts++) {
+		for (uint8_t phase = 0; phase < 2; phase++) {
+			dmr_call_config_t c = base_cfg();
+			c.rmo = true;
+			c.ts = ts;
+			setup(&c);
+			sim.repeater = true;
+			sim.slot = phase;
+			run_ms(180);
+			CHECK(V()->repeater_up);
+			dmr_call_ptt(true);
+			run_ms(600);
+			CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE);
+			dmr_call_ptt(false);
+			run_ms(600);
+			CHECK(V()->phase == DMR_CALL_PHASE_IDLE && sim.air_count > 0);
+			bool voice = false;
+			for (unsigned i = 0; i < sim.air_count; i++) {
+				// The ts recorded at tx_begin says nothing about which slot the bursts used
+				CHECK(1 + (sim.air[i].slot & 1) == ts);
+				voice |= sim.air[i].kind == DMR_BURST_VOICE;
+			}
+			CHECK(voice);
+		}
+	}
+}
+
+static void test_rmo_wakeup(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t csbk[12], lc[9];
+	unsigned v;
+
+	c.rmo = true;
+	c.ts = 2;
+	setup(&c);
+	CHECK(sim.locked_ts == 2 && sim.cfg.repeater);
+	sim.wake_repeater_on_csbk = true;
+	dmr_call_ptt(true);
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_WAKEUP && V()->state == DMR_CALL_STATE_TX);
+	run_ms(400);
+	dmr_csbk_bs_activation(OWN_ID, csbk);
+	CHECK(sim.air_count >= 1 && sim.air[0].kind == DMR_BURST_CSBK && sim.air[0].host_crc &&
+	      memcmp(sim.air[0].payload, csbk, 12) == 0);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && V()->repeater_up);
+	CHECK(sim.last_timing == DMR_TIMING_ALIGNED && sim.last_ts == 2 && sim.last_access == DMR_ACCESS_IMPOLITE);
+	run_ms(700);
+	dmr_call_ptt(false);
+	run_ms(600);
+	mk_lc(lc, 0, TG_TALK, OWN_ID);
+	check_tx_burst_sequence(1, lc, &v);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+
+	// A second PTT while the repeater is still up: no wake-up
+	unsigned before = sim.air_count;
+	dmr_call_ptt(true);
+	run_ms(100);
+	CHECK(sim.air[before].kind == DMR_BURST_VOICE_LC_HEADER);
+	dmr_call_ptt(false);
+	run_ms(600);
+
+	// A short press: the wake-up goes on after the release, and nothing else is sent once the repeater is up
+	setup(&c);
+	sim.wake_repeater_on_csbk = true;
+	dmr_call_ptt(true);
+	run_ms(10);
+	dmr_call_ptt(false);
+	run_ms(20);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_WAKEUP);
+	run_ms(600);
+	CHECK(sim.air_count == 1 && sim.air[0].kind == DMR_BURST_CSBK);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE && V()->tx_error == DMR_TX_OK && V()->repeater_up);
+
+	// A short press and no repeater: every try is sent, then given up without a denial left on show
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(10);
+	dmr_call_ptt(false);
+	run_ms(3000);
+	unsigned tries = 0;
+	for (unsigned i = 0; i < sim.air_count; i++)
+		tries += sim.air[i].kind == DMR_BURST_CSBK;
+	CHECK(tries == DMR_CALL_WAKEUP_ATTEMPTS && sim.air_count == tries);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE && V()->tx_error == DMR_TX_ERR_NO_REPEATER);
+
+	// No repeater: three tries 600 ms apart, then refused
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(3000);
+	unsigned csbks = 0;
+	for (unsigned i = 0; i < sim.air_count; i++)
+		csbks += sim.air[i].kind == DMR_BURST_CSBK;
+	CHECK(csbks == DMR_CALL_WAKEUP_ATTEMPTS && sim.air_count == csbks);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_NO_REPEATER);
+	dmr_call_ptt(false);
+	run_ms(20);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+}
+
+// Bursts of one kind the sim modem put on the air
+static unsigned air_of(uint8_t kind)
+{
+	unsigned n = 0;
+	for (unsigned i = 0; i < sim.air_count; i++)
+		n += sim.air[i].kind == kind;
+	return n;
+}
+
+static unsigned csbks_on_air(void)
+{
+	return air_of(DMR_BURST_CSBK);
+}
+
+static unsigned rpt_drops(void)
+{
+	dmr_call_stats_t st;
+
+	dmr_call_get_stats(&st);
+	return st.tx_rpt_drops;
+}
+
+// Through a repeater, a voice start that never gets a slot (the modem hears no timing at all, so its own wait never
+// runs out): the stall cut wakes the repeater again instead of refusing
+static void test_rmo_start_stalled(void)
+{
+	dmr_call_config_t c = base_cfg();
+	c.rmo = true;
+	c.ts = 2;
+
+	setup(&c);
+	sim.repeater = true;
+	sim.wake_repeater_on_csbk = true;
+	run_ms(180);
+	CHECK(V()->repeater_up);
+	sim.stalled = true;
+	sim.repeater = false;
+	dmr_call_ptt(true);
+	run_ms(DMR_CALL_TX_STALL_MS + DMR_CALL_TX_ALIGN_GRACE_MS + 100);
+	CHECK(V()->tx_error == DMR_TX_OK && V()->phase == DMR_CALL_PHASE_TX_WAKEUP && sim.tx_aborts == 1);
+	sim.stalled = false;
+	run_ms(800);
+	CHECK(csbks_on_air() >= 1 && V()->phase == DMR_CALL_PHASE_TX_VOICE && V()->tx_error == DMR_TX_OK);
+	CHECK(air_of(DMR_BURST_VOICE) > 0);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+
+	// A modem that stays stalled: the wake-up goes nowhere either and the key-up is refused in the end, one re-wake
+	setup(&c);
+	sim.repeater = true;
+	run_ms(180);
+	sim.stalled = true;
+	sim.repeater = false;
+	dmr_call_ptt(true);
+	run_ms(12000);
+	CHECK(V()->tx_error != DMR_TX_OK && V()->phase == DMR_CALL_PHASE_TX_DENIED && sim.tx_aborts == 1);
+	dmr_call_ptt(false);
+	sim.stalled = false;
+	run_ms(600);
+}
+
+// Where the modem gives the repeater's bursts, its slot numbers running on after the repeater dropped don't keep it
+// up: a key-up 0.6 s later wakes it first (bench: voice sent to the dropped repeater, no slot, the start stalled)
+static void test_rmo_up_from_bursts(void)
+{
+	dmr_call_config_t c = base_cfg();
+	c.rmo = true;
+	c.ts = 2;
+
+	setup(&c);
+	sim.listen_bursts = true;
+	sim.repeater = true;
+	sim.wake_repeater_on_csbk = true;
+	run_ms(300);
+	CHECK(V()->repeater_up);
+	sim.repeater = false;
+	sim.free_ticks = true;	// the modem's own timing
+	run_ms(600);
+	CHECK(!V()->repeater_up);
+	sim.free_ticks = false;
+	dmr_call_ptt(true);
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_WAKEUP);
+	run_ms(800);
+	CHECK(csbks_on_air() == 1 && V()->phase == DMR_CALL_PHASE_TX_VOICE && V()->tx_error == DMR_TX_OK);
+	dmr_call_ptt(false);
+	run_ms(600);
+
+	// A modem that gives no bursts: the slot numbers still count, as before
+	setup(&c);
+	sim.repeater = true;
+	run_ms(300);
+	sim.repeater = false;
+	sim.free_ticks = true;
+	run_ms(600);
+	CHECK(V()->repeater_up);
+	sim.free_ticks = false;
+}
+
+// A wake-up goes on our own timing: on the timing the modem last had (a repeater that just dropped) the HR_C6000 sent
+// nothing (bench: one CSBK of three lost, the key-up 0.6 s after the drop never on air). One whose transmission ends
+// without going on air is tried again at once, not after DMR_CALL_TX_DONE_GUARD_MS
+static void test_rmo_wake_lost(void)
+{
+	dmr_call_config_t c = base_cfg();
+	dmr_call_stats_t st;
+	c.rmo = true;
+	c.ts = 2;
+
+	setup(&c);
+	sim.listen_bursts = true;	// the repeater's own bursts say it is up, not the slot numbers below
+	sim.repeater = true;
+	run_ms(180);
+	sim.repeater = false;
+	sim.free_ticks = true;	// the modem's slot numbers run on: there is timing to follow, but no repeater
+	run_ms(400);
+	sim.lose_own_csbk = true;
+	sim.wake_repeater_on_csbk = true;
+	dmr_call_ptt(true);
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_WAKEUP && sim.last_timing == DMR_TIMING_OWN);
+	run_ms(400);
+	CHECK(sim.lost_tx == 0 && csbks_on_air() == 1 && V()->phase == DMR_CALL_PHASE_TX_VOICE);
+	dmr_call_ptt(false);
+	run_ms(600);
+	sim.free_ticks = false;
+
+	// A CSBK lost whatever its timing: the next goes at once, the wake-up's tries counted as before
+	setup(&c);
+	sim.repeater = true;
+	run_ms(180);
+	sim.repeater = false;
+	run_ms(400);
+	sim.wake_repeater_on_csbk = true;
+	sim.lose_next = 1;
+	dmr_call_get_stats(&st);
+	unsigned l0 = st.tx_wake_lost;
+	dmr_call_ptt(true);
+	run_ms(400);
+	dmr_call_get_stats(&st);
+	CHECK(sim.lost_tx == 1 && csbks_on_air() == 1 && V()->phase == DMR_CALL_PHASE_TX_VOICE);
+	CHECK(st.tx_wake_lost == l0 + 1 && V()->wake_sent == 2);
+	dmr_call_ptt(false);
+	run_ms(600);
+
+	// Every one lost: refused after the tries, as when the repeater never answers
+	setup(&c);
+	sim.repeater = true;
+	run_ms(180);
+	sim.repeater = false;
+	run_ms(400);
+	sim.lose_next = 99;
+	dmr_call_ptt(true);
+	run_ms(2000);
+	CHECK(V()->tx_error == DMR_TX_ERR_NO_REPEATER && sim.lost_tx == DMR_CALL_WAKEUP_ATTEMPTS);
+	dmr_call_ptt(false);
+	run_ms(600);
+}
+
+// Listening, a repeater that drops while our aligned start waits for its slot (its last bursts taken as up, or as the
+// answer to our wake-up) is woken again DMR_CALL_TX_START_DROP_MS on, not at the modem's own timeout of 1.5 s, longer
+// than a short key-up (bench: one CSBK, then nothing on air for the whole key-up). Not at DMR_CALL_TX_DROP_MS: a
+// receiver that hears nothing for a while there, as the HR_C5000 at times does after our wake-up, is no drop
+static void test_rmo_drop_before_first_burst(void)
+{
+	dmr_call_config_t c = base_cfg();
+	dmr_call_stats_t st;
+	c.rmo = true;
+	c.ts = 2;
+
+	setup(&c);
+	sim.listen_bursts = true;
+	sim.held_slot_numbers = true;
+	sim.align_needs_repeater = true;
+	sim.repeater = true;
+	run_ms(180);
+	dmr_call_get_stats(&st);
+	unsigned d0 = st.tx_rpt_drops;
+	sim.repeater = false;
+	dmr_call_ptt(true);	// still up as far as the radio knows: the voice starts, aligned
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && sim.last_timing == DMR_TIMING_ALIGNED);
+	sim.wake_repeater_on_csbk = true;
+	run_ms(DMR_CALL_TX_DROP_MS + 100);
+	CHECK(sim.tx_aborts == 0 && csbks_on_air() == 0);	// silent past DMR_CALL_TX_DROP_MS: not yet
+	run_ms(DMR_CALL_TX_START_DROP_MS - DMR_CALL_TX_DROP_MS);
+	dmr_call_get_stats(&st);
+	CHECK(st.tx_rpt_drops == d0 + 1 && sim.tx_aborts == 1 && csbks_on_air() == 1 && sim.align_rejects == 0);
+	run_ms(500);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && V()->tx_error == DMR_TX_OK && air_of(DMR_BURST_VOICE) > 0);
+	dmr_call_ptt(false);
+	run_ms(800);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+
+	// Heard again before DMR_CALL_TX_START_DROP_MS (the receiver deaf for a while, the repeater up): the voice starts
+	// with no wake-up
+	setup(&c);
+	sim.listen_bursts = true;
+	sim.held_slot_numbers = true;
+	sim.align_needs_repeater = true;
+	sim.repeater = true;
+	run_ms(180);
+	dmr_call_get_stats(&st);
+	d0 = st.tx_rpt_drops;
+	sim.repeater = false;
+	dmr_call_ptt(true);
+	run_ms(DMR_CALL_TX_START_DROP_MS - 150);
+	sim.repeater = true;
+	run_ms(500);
+	dmr_call_get_stats(&st);
+	CHECK(st.tx_rpt_drops == d0 && sim.tx_aborts == 0 && csbks_on_air() == 0 && air_of(DMR_BURST_VOICE) > 0);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && V()->tx_error == DMR_TX_OK);
+	dmr_call_ptt(false);
+	run_ms(800);
+
+	// Not listening: left to the modem's timeout, as before
+	setup(&c);
+	sim.listen_bursts = true;
+	sim.no_split_listen = true;
+	sim.held_slot_numbers = true;
+	sim.align_needs_repeater = true;
+	sim.repeater = true;
+	run_ms(180);
+	sim.repeater = false;
+	dmr_call_ptt(true);
+	run_ms(DMR_CALL_TX_DROP_MS + 100);
+	CHECK(sim.tx_aborts == 0 && csbks_on_air() == 0);
+	dmr_call_ptt(false);
+	run_ms(2500);
+}
+
+static unsigned data_left;
+
+static bool data_next(dmr_tx_burst_t *out, void *ctx)
+{
+	(void)ctx;
+	if (data_left == 0)
+		return false;
+	data_left--;
+	memset(out, 0, sizeof(*out));
+	out->kind = DMR_BURST_RATE_12_DATA;
+	out->len = 12;
+	return true;
+}
+
+// A data list after a voice over that listened: no repeater burst comes between its bursts (the modem doesn't listen),
+// so the slot numbers keep the repeater up, as before the over (else, past DMR_CALL_REPEATER_HOLD_MS, a PTT press
+// after the list woke a repeater that was up)
+static void test_rmo_data_after_listened_over(void)
+{
+	dmr_call_config_t c = base_cfg();
+	dmr_data_source_t d = { .next = data_next, .count = 12 };
+	c.rmo = true;
+	c.ts = 2;
+
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.listen_bursts = true;
+	sim.repeater = true;
+	run_ms(180);
+	dmr_call_ptt(true);
+	run_ms(400);
+	CHECK(sim.tx_listens == 1 && V()->phase == DMR_CALL_PHASE_TX_VOICE);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE && V()->repeater_up);
+	data_left = 12;
+	CHECK(dmr_call_data_tx(&d));
+	run_ms(DMR_CALL_REPEATER_HOLD_MS + 300);
+	CHECK(dmr_call_data_busy() && V()->repeater_up);
+	run_ms(1000);
+	CHECK(!dmr_call_data_busy());
+}
+
+// Listening between our bursts through a repeater (tx_listen): a repeater that drops under our over (its hang ended
+// as we keyed, issue 538) is woken again and the voice starts over
+static void test_rmo_drop_under_over(void)
+{
+	dmr_call_config_t c = base_cfg();
+	c.rmo = true;
+	c.ts = 2;
+	unsigned d0;
+
+	dmr_call_set_tx_listen(true);
+
+	// Up the whole over: its bursts heard between ours, nothing done
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.listen_bursts = true;
+	sim.repeater = true;
+	run_ms(180);
+	d0 = rpt_drops();
+	dmr_call_ptt(true);
+	run_ms(1500);
+	CHECK(sim.tx_listens == 1 && V()->phase == DMR_CALL_PHASE_TX_VOICE && V()->tx_error == DMR_TX_OK);
+	CHECK(rpt_drops() == d0 && csbks_on_air() == 0 && sim.tx_aborts == 0 && air_of(DMR_BURST_VOICE) > 10);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+
+	// It drops 300 ms into the over: ended within DMR_CALL_TX_DROP_MS and a few slots, woken, the voice again
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.listen_bursts = true;
+	sim.repeater = true;
+	sim.wake_repeater_on_csbk = true;
+	run_ms(180);
+	d0 = rpt_drops();
+	dmr_call_ptt(true);
+	run_ms(300);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && air_of(DMR_BURST_VOICE) > 0);
+	sim.repeater = false;
+	run_ms(200);
+	CHECK(rpt_drops() == d0 && sim.tx_aborts == 0);	// not yet: 240 ms
+	run_ms(150);
+	CHECK(rpt_drops() == d0 + 1 && sim.tx_aborts == 0 && sim.tx_ends == 1);	// ended, not aborted
+	run_ms(400);
+	unsigned v = air_of(DMR_BURST_VOICE);
+	CHECK(csbks_on_air() == 1 && sim.repeater);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && V()->tx_error == DMR_TX_OK && air_of(DMR_BURST_VOICE) > v);
+	CHECK(rpt_drops() == d0 + 1);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE && src.ends == 2);	// the dropped over's source ended too
+
+	// A neighbor's repeater on another color code heard between our bursts (a modem that doesn't filter the CC) is
+	// not ours: the drop of ours is still seen
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.listen_bursts = true;
+	sim.repeater = true;
+	run_ms(180);
+	d0 = rpt_drops();
+	dmr_call_ptt(true);
+	run_ms(300);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && air_of(DMR_BURST_VOICE) > 0);
+	sim.listen_other_cc = true;	// ours down, the neighbor's on
+	run_ms(DMR_CALL_TX_DROP_MS + 110);
+	CHECK(rpt_drops() == d0 + 1 && sim.tx_ends == 1);
+	dmr_call_ptt(false);
+	run_ms(4000);
+
+	// The repeater still sends our aborted over (its echo, our ID) as it is woken: not a call that makes the channel
+	// busy, so the voice starts again (bench: refused as busy)
+	c.access = DMR_ACCESS_POLITE_CC;
+	c.access_wait_ms = 0;
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.listen_bursts = true;
+	sim.repeater = true;
+	run_ms(180);
+	d0 = rpt_drops();
+	dmr_call_ptt(true);
+	run_ms(300);
+	sim.repeater = false;
+	for (int i = 0; i < 40 && rpt_drops() == d0; i++)
+		run_ms(10);
+	CHECK(rpt_drops() == d0 + 1);
+	{
+		uint8_t own[9];
+		unsigned fr = 0;
+
+		mk_lc(own, 0, TG_TALK, OWN_ID);
+		run_ms(60);	// the wake-up's CSBK out
+		sim.repeater = true;	// up, sending our over's echo before its own idle bursts are heard
+		sim.listen_bursts = false;
+		rx_header(own, 1, 2, DMR_SYNC_BS, false);
+		run_ms(60);
+		for (int i = 0; i < 12; i++) {
+			rx_voice((uint8_t)(i % 6), 1, 2, DMR_SYNC_BS, &fr, i % 6 == 5 ? own : NULL, false);
+			run_ms(60);
+		}
+	}
+	sim.listen_bursts = true;
+	unsigned ve = air_of(DMR_BURST_VOICE);
+	run_ms(800);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && V()->tx_error == DMR_TX_OK && air_of(DMR_BURST_VOICE) > ve);
+	dmr_call_ptt(false);
+	run_ms(1000);
+	c = base_cfg();
+	c.rmo = true;
+	c.ts = 2;
+
+	// The same, the replay coming after the first wake-up went unanswered, past DMR_CALL_OWN_ECHO_MS: still our own
+	// echo while the key-up lasts, not a parrot's playback (bench: refused as busy, the replay 0.8 s after the drop)
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.listen_bursts = true;
+	sim.repeater = true;
+	run_ms(180);
+	d0 = rpt_drops();
+	dmr_call_ptt(true);
+	run_ms(300);
+	sim.repeater = false;
+	for (int i = 0; i < 40 && rpt_drops() == d0; i++)
+		run_ms(10);
+	run_ms(DMR_CALL_OWN_ECHO_MS + 100);
+	{
+		uint8_t own[9];
+		unsigned fr = 0;
+
+		mk_lc(own, 0, TG_TALK, OWN_ID);
+		sim.repeater = true;
+		sim.listen_bursts = false;
+		rx_header(own, 1, 2, DMR_SYNC_BS, false);
+		run_ms(60);
+		for (int i = 0; i < 12; i++) {
+			rx_voice((uint8_t)(i % 6), 1, 2, DMR_SYNC_BS, &fr, i % 6 == 5 ? own : NULL, false);
+			run_ms(60);
+		}
+	}
+	sim.listen_bursts = true;
+	ve = air_of(DMR_BURST_VOICE);
+	run_ms(800);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && V()->tx_error == DMR_TX_OK && air_of(DMR_BURST_VOICE) > ve);
+	CHECK(sink_log.begins == 0);	// not played
+	dmr_call_ptt(false);
+	run_ms(1000);
+	c = base_cfg();
+	c.rmo = true;
+	c.ts = 2;
+
+	// It drops and doesn't answer the wake-up: the key-up ends as any unanswered wake-up does, no second try
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.listen_bursts = true;
+	sim.repeater = true;
+	run_ms(180);
+	d0 = rpt_drops();
+	dmr_call_ptt(true);
+	run_ms(120);
+	sim.repeater = false;
+	run_ms(4000);
+	CHECK(rpt_drops() == d0 + 1 && V()->tx_error != DMR_TX_OK && V()->phase != DMR_CALL_PHASE_TX_VOICE);
+	dmr_call_ptt(false);
+	run_ms(600);
+
+	// It drops, and the modem's slot numbers run on from its own timing: they don't answer the wake-up, only the
+	// repeater's bursts do. Not answered: no voice to a repeater that is down
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.listen_bursts = true;
+	sim.repeater = true;
+	run_ms(180);
+	d0 = rpt_drops();
+	dmr_call_ptt(true);
+	run_ms(300);
+	sim.repeater = false;
+	sim.free_ticks = true;
+	run_ms(400);
+	CHECK(rpt_drops() == d0 + 1);
+	unsigned v0 = air_of(DMR_BURST_VOICE);
+	run_ms(4000);
+	CHECK(csbks_on_air() == 3);	// every wake-up try, none answered
+	CHECK(air_of(DMR_BURST_VOICE) == v0 && V()->tx_error == DMR_TX_ERR_NO_REPEATER);
+	dmr_call_ptt(false);
+	run_ms(600);
+	sim.free_ticks = false;
+
+	// Not listening: the drop goes unseen, as before
+	dmr_call_set_tx_listen(false);
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.listen_bursts = true;
+	sim.repeater = true;
+	run_ms(180);
+	d0 = rpt_drops();
+	dmr_call_ptt(true);
+	run_ms(120);
+	sim.repeater = false;
+	run_ms(1000);
+	CHECK(sim.tx_listens == 0 && rpt_drops() == d0 && sim.tx_aborts == 0 && V()->phase == DMR_CALL_PHASE_TX_VOICE);
+	dmr_call_ptt(false);
+	run_ms(600);
+	dmr_call_set_tx_listen(DMR_CALL_TX_LISTEN);
+
+	// A radio whose RF can't receive between bursts on a split channel (tx_listen_split refused): the same
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.listen_bursts = true;
+	sim.no_split_listen = true;
+	sim.repeater = true;
+	run_ms(180);
+	d0 = rpt_drops();
+	dmr_call_ptt(true);
+	run_ms(120);
+	sim.repeater = false;
+	run_ms(1000);
+	CHECK(sim.tx_listens == 0 && rpt_drops() == d0 && sim.tx_aborts == 0 && V()->phase == DMR_CALL_PHASE_TX_VOICE);
+	dmr_call_ptt(false);
+	run_ms(600);
+}
+
+// A modem that hears the repeater in only some of the slots between our bursts (tx_listen_gaps): it still listens, so
+// the repeater's RC stops the over, but silence there isn't the repeater's drop. Counted as one, the over through an
+// up repeater ended 0.5 s in and was keyed again
+static void test_rmo_listen_gaps(void)
+{
+	dmr_call_config_t c = base_cfg();
+	c.rmo = true;
+	c.ts = 2;
+	unsigned d0;
+
+	dmr_call_set_tx_listen(true);
+	modem = &sim_modem_gaps;
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.listen_bursts = true;
+	sim.listen_deaf = true;	// none of its bursts heard while we send
+	sim.repeater = true;
+	run_ms(180);
+	d0 = rpt_drops();
+	dmr_call_ptt(true);
+	run_ms(1500);
+	CHECK(sim.tx_listens == 1 && V()->phase == DMR_CALL_PHASE_TX_VOICE && V()->tx_error == DMR_TX_OK);
+	CHECK(rpt_drops() == d0 && sim.tx_aborts == 0 && sim.tx_ends == 0 && csbks_on_air() == 0);
+	sim_rc(dmrFecRcInfo(DMR_RC_CEASE), 0);
+	run_ms(100);
+	sim_rc(dmrFecRcInfo(DMR_RC_CEASE), 0);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_CEASED);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+	modem = &sim_modem;
+	dmr_call_set_tx_listen(DMR_CALL_TX_LISTEN);
+}
+
+// Keyed as the repeater's hang ends (issue 524): it still counts as up, so no wake-up, and the modem's aligned start
+// finds no repeater timing. The modem's own slot numbers while it transmits must not keep the repeater "up", and the
+// refused start wakes the repeater instead of being refused, once per key-up
+static void test_rmo_hang_end(void)
+{
+	dmr_call_config_t c = base_cfg();
+	c.rmo = true;
+	c.ts = 2;
+
+	// The repeater dropped just before the key-up: the start is refused, the repeater woken, the call goes
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.align_needs_repeater = true;
+	sim.repeater = true;
+	run_ms(180);
+	CHECK(V()->repeater_up);
+	sim.repeater = false;
+	sim.wake_repeater_on_csbk = true;
+	dmr_call_ptt(true);
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && sim.air_count == 0);	// no wake-up: it was up
+	run_ms(600);
+	CHECK(!V()->repeater_up);	// the modem's slot numbers while it waits don't count
+	run_ms(1200);
+	CHECK(sim.align_rejects == 1 && csbks_on_air() == 1);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && V()->tx_error == DMR_TX_OK && V()->repeater_up);
+	CHECK(air_of(DMR_BURST_VOICE) > 0);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE && src.ends == 2);	// the refused start's source ended too
+
+	// The same with an encoder slow to start (only the headers queued): the modem's refusal still comes before the
+	// call layer's stall cut, so the repeater is woken, not the start refused as stalled
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.align_needs_repeater = true;
+	sim.repeater = true;
+	run_ms(180);
+	sim.repeater = false;
+	sim.wake_repeater_on_csbk = true;
+	src.starve = true;
+	dmr_call_ptt(true);
+	run_ms(1810);
+	CHECK(sim.align_rejects == 1 && csbks_on_air() == 1 && V()->tx_error == DMR_TX_OK);
+	src.starve = false;
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && V()->tx_error == DMR_TX_OK && air_of(DMR_BURST_VOICE) > 0);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+
+	// The repeater woken but its timing never heard: refused at the second start, no third
+	setup(&c);
+	sim.held_slot_numbers = true;
+	sim.align_needs_repeater = true;
+	sim.repeater = true;
+	run_ms(180);
+	sim.repeater = false;
+	dmr_call_ptt(true);
+	run_ms(1900);
+	CHECK(sim.align_rejects == 1 && csbks_on_air() == 1);
+	sim.repeater = true;	// answers the wake-up: up, so the voice starts aligned again ..
+	run_ms(150);
+	sim.repeater = false;	// .. and the timing is gone before the start found it
+	run_ms(2000);
+	CHECK(sim.align_rejects == 2 && csbks_on_air() == 1);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_REJECTED);
+	dmr_call_ptt(false);
+	run_ms(30);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE);
+
+	// Refused after the first burst went: refused, no wake-up
+	setup(&c);
+	sim.repeater = true;
+	run_ms(180);
+	dmr_call_ptt(true);
+	run_ms(200);
+	sim.reject_next = true;
+	run_ms(100);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_REJECTED && csbks_on_air() == 0);
+	dmr_call_ptt(false);
+	run_ms(30);
+
+	// Direct mode: refused as before
+	c.rmo = false;
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(30);
+	sim.reject_next = true;
+	run_ms(100);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && csbks_on_air() == 0);
+	dmr_call_ptt(false);
+	run_ms(30);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// RX
+
+static void test_rx_call(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	unsigned frame = 1;
+
+	setup(&c);
+	mk_lc(lc, DMR_FLCO_GROUP_VOICE, TG_LIST, 9997030);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+	run_ms(20);
+	CHECK(V()->state == DMR_CALL_STATE_RX && V()->phase == DMR_CALL_PHASE_RX_VOICE);
+	CHECK(sink_log.begins == 1 && sink_log.caller.src == 9997030 && sink_log.caller.dst == TG_LIST &&
+	      sink_log.caller.group && !sink_log.caller.late_entry);
+	CHECK(V()->caller.src == 9997030 && V()->rssi_dbm == 0);
+	run_ms(40);
+	rx_call(lc, 1, true, 0, 2, false, &frame);	// more headers (same call), then two superframes
+	CHECK(sink_log.begins == 1 && sink_log.frames == 36 && sink_log.losts == 0);
+	for (unsigned i = 0; i < 36; i++)
+		CHECK(sink_log.seq[i] == (uint8_t)(i + 1));
+	CHECK(V()->rssi_dbm == -85);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, true);
+	run_ms(20);
+	CHECK(sink_log.ends == 1 && V()->state == DMR_CALL_STATE_IDLE);
+	CHECK(V()->last_heard.src == 9997030 && V()->last_heard_ms == now - 10);
+	// Reply window: PTT now goes to the TG just heard
+	CHECK(V()->reply_active && V()->tx_target.id == TG_LIST && !V()->tx_target.private_call);
+	CHECK(V()->reply_s == 10);
+	dmr_call_ptt(true);
+	run_ms(20);
+	uint8_t want[9];
+	mk_lc(want, 0, TG_LIST, OWN_ID);
+	CHECK(memcmp(sim.emb_lc, want, 9) == 0);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->reply_active && V()->tx_target.id == TG_LIST);	// renewed by our reply
+	dmr_call_reply_cancel();
+	run_ms(10);
+	CHECK(!V()->reply_active && V()->tx_target.id == TG_TALK);
+
+	// A burst missing in the middle is concealed; the fade timeout ends a call without a terminator
+	setup(&c);
+	frame = 1;
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	unsigned skip = frame;
+	frame += 3;
+	run_ms(60);	// burst A of the next superframe never heard
+	for (int i = 1; i < 6; i++) {
+		rx_voice((uint8_t)i, 1, 0, DMR_SYNC_MS, &frame, NULL, false);
+		run_ms(60);
+	}
+	CHECK(sink_log.frames == 18 + 15 && sink_log.losts == 3);
+	CHECK(sink_log.seq[18] == (uint8_t)(skip + 3));
+	run_ms(DMR_CALL_FADE_MS - 60);
+	CHECK(V()->state == DMR_CALL_STATE_RX);
+	run_ms(60);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE && sink_log.ends == 1);
+}
+
+// Another slot on the same channel only moves the slot lock: a modem restart would lose sync and miss the call's start
+static void test_slot_change_keeps_modem(void)
+{
+	dmr_call_config_t c = base_cfg();
+
+	c.rmo = true;
+	c.ts = 1;
+	setup(&c);
+	unsigned n = sim.configures;
+	CHECK(sim.locked_ts == 1);
+	c.ts = 2;
+	dmr_call_configure(&c);
+	CHECK(sim.configures == n && sim.locked_ts == 2);
+	c.both_slots = true;
+	dmr_call_configure(&c);
+	CHECK(sim.configures == n && sim.locked_ts == 0);
+	c.cc = (uint8_t)((c.cc + 1) & 0x0F);	// another channel's settings: the modem is told
+	dmr_call_configure(&c);
+	CHECK(sim.configures == n + 1 && sim.cfg.cc == (int8_t)c.cc);
+}
+
+// The modem reports bursts in batches: the call's last voice bursts can come after its terminator. They must not start
+// a second call by late entry (HIL 2026-10-10: one bench call counted as two or three)
+static void test_rx_no_call_after_terminator(void)
+{
+	dmr_call_config_t c = base_cfg();
+	dmr_call_stats_t st;
+	uint8_t lc[9];
+	unsigned frame = 1;
+
+	setup(&c);
+	dmr_call_reset_stats();
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	rx_call(lc, 1, true, 0, 2, true, &frame);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE && sink_log.begins == 1 && sink_log.ends == 1);
+	rx_voice(4, 1, 0, DMR_SYNC_MS, &frame, NULL, false);
+	run_ms(1);
+	rx_voice(5, 1, 0, DMR_SYNC_MS, &frame, lc, false);
+	run_ms(60);
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_calls == 1 && st.rx_term_dropped >= 1 && sink_log.begins == 1);
+	CHECK(st.rx_end_term == 1 && st.rx_end_fade == 0 && st.rx_end_sync == 0);
+
+	// The same talker again after the fade time, entered late: a new call
+	run_ms(DMR_CALL_FADE_MS);
+	rx_call(lc, 1, false, 4, 3, false, &frame);
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_calls == 2 && st.rx_late_entries == 1 && sink_log.begins == 2);
+	// No terminator: the fade ends it, and the count says so
+	run_ms(DMR_CALL_FADE_MS + 60);
+	dmr_call_get_stats(&st);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE && st.rx_end_term == 1 && st.rx_end_fade == 1 && st.rx_end_sync == 0);
+}
+
+// A repeater with restricted access (RAS): its key changes the header's RS parity and the embedded LC's checksum, so
+// the voice comes with no LC the stack can check. Without hear all nothing plays (the group can't be told); with hear
+// all (digital monitor) a whole superframe in order plays as an unknown group call, and an LC that decodes later
+// names it
+static void test_rx_ras_voice_without_lc(void)
+{
+	dmr_call_config_t c = base_cfg();
+	dmr_call_stats_t st;
+	unsigned frame = 1;
+
+	setup(&c);
+	dmr_call_reset_stats();
+	for (int sf = 0; sf < 2; sf++)
+		for (int i = 0; i < 6; i++) {
+			rx_voice((uint8_t)i, 1, 0, DMR_SYNC_MS, &frame, NULL, false);
+			run_ms(60);
+		}
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_calls == 0 && sink_log.begins == 0 && sink_log.frames == 0);
+	run_ms(DMR_CALL_FADE_MS);
+
+	c.listen.hear_all = true;
+	setup(&c);
+	dmr_call_reset_stats();
+	for (int i = 0; i < 6; i++) {
+		CHECK(sink_log.begins == 0);	// not before a whole superframe in order
+		rx_voice((uint8_t)i, 1, 0, DMR_SYNC_MS, &frame, NULL, false);
+		run_ms(60);
+	}
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_calls == 1 && st.rx_no_lc_calls == 1 && st.rx_calls_played == 1 && sink_log.begins == 1);
+	CHECK(V()->state == DMR_CALL_STATE_RX && V()->caller.src == 0 && V()->caller.group);
+	CHECK(sink_log.frames == 3);	// burst F, the sixth: from there on
+	for (int i = 0; i < 6; i++) {
+		rx_voice((uint8_t)i, 1, 0, DMR_SYNC_MS, &frame, NULL, false);
+		run_ms(60);
+	}
+	CHECK(sink_log.frames == 3 + 18 && sink_log.losts == 0);
+
+	// An LC that decodes (a key-less talker, or the LC with a good checksum) names the call
+	uint8_t lc[9];
+	mk_lc(lc, 0, TG_TALK, 2345678);
+	rx_voice(0, 1, 0, DMR_SYNC_MS, &frame, NULL, false);
+	run_ms(60);
+	rx_voice(1, 1, 0, DMR_SYNC_MS, &frame, lc, false);
+	run_ms(60);
+	CHECK(V()->caller.src == 2345678 && V()->caller.dst == TG_TALK);
+
+	// The voice stops: the call fades out as any other
+	run_ms(DMR_CALL_FADE_MS + 60);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE && sink_log.ends >= 1);
+
+	// Out of order bursts (noise) never make the run; a burst with a bad EMB doesn't start it
+	dmr_call_reset_stats();
+	static const uint8_t order[] = { 0, 2, 3, 5, 1, 4, 0, 3 };
+	for (unsigned k = 0; k < sizeof order; k++) {
+		rx_voice(order[k], 1, 0, DMR_SYNC_MS, &frame, NULL, false);
+		run_ms(60);
+	}
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_no_lc_calls == 0);
+
+	// Privacy (the PI bit in the EMB) is never played
+	run_ms(DMR_CALL_FADE_MS);
+	unsigned frames = sink_log.frames;
+	for (int i = 0; i < 12; i++) {
+		rx_voice((uint8_t)(i % 6), 1, 0, DMR_SYNC_MS, &frame, NULL, true);
+		run_ms(60);
+	}
+	CHECK(sink_log.frames == frames);
+	c.listen.hear_all = false;
+	setup(&c);
+}
+
+// Digital monitor listens like a scanner: with any_cc a call on another color code and the other slot plays, a RAS
+// repeater's too (the modem takes both slots when both_ts is on, as the radio core sets it with hear_all). No CC
+// pinning is needed on transmit: the modem's TX still uses the channel's code (its configure, not the RX scan
+// filter), so the transmission goes out on the channel's color code
+static void test_rx_monitor_any_cc_ts(void)
+{
+	dmr_call_config_t c = base_cfg();
+	dmr_call_stats_t st;
+	unsigned frame = 1;
+
+	c.rmo = true;
+	setup(&c);
+	CHECK(sim.locked_ts == 1 && sim.cc_filter == 1 && !sim.cfg.voice_no_lc);
+	c.listen.hear_all = c.listen.any_cc = c.listen.both_ts = true;
+	dmr_call_configure(&c);
+	CHECK(sim.locked_ts == 0 && sim.cc_filter == -1 && sim.cfg.voice_no_lc);
+
+	dmr_call_reset_stats();
+	for (int i = 0; i < 6; i++) {
+		rx_voice((uint8_t)i, 9, 2, DMR_SYNC_BS, &frame, NULL, false);	// code 9, slot 2, no LC that decodes
+		run_ms(60);
+	}
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_no_lc_calls == 1 && st.rx_calls_played == 1 && sink_log.begins == 1);
+	CHECK(V()->state == DMR_CALL_STATE_RX && V()->rx_cc == 9 && st.rx_ts_dropped == 0 && st.rx_cc_dropped == 0);
+	run_ms(DMR_CALL_FADE_MS + 60);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE);
+
+	c.rmo = false;	// direct mode: no repeater to wake first
+	dmr_call_configure(&c);
+	CHECK(sim.cc_filter == -1);
+	dmr_call_ptt(true);
+	run_ms(360 * 2);
+	CHECK(sim.tx_begins >= 1 && sim.cfg.cc == 1);	// the channel's code, while the monitor still scans
+	dmr_call_ptt(false);
+	run_ms(1200);
+	CHECK(!sim.tx_active && sim.cc_filter == -1);	// scanning again
+}
+
+// A call that fades (a dropout, no terminator) and comes back by late entry with its own LC is one call with a hole in
+// it: the sink hears it end and begin, the books count one. Another LC, a terminator or a longer gap make it a new call
+static void test_rx_resumed_call(void)
+{
+	dmr_call_config_t c = base_cfg();
+	dmr_call_stats_t st;
+	uint8_t lc[9], other[9];
+	unsigned frame = 1;
+
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	mk_lc(other, 0, TG_LIST, 9997004);
+	setup(&c);
+	dmr_call_reset_stats();
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	uint32_t started = V()->call_start_ms;
+	run_ms(DMR_CALL_FADE_MS + 200);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE && sink_log.ends == 1);
+	rx_call(lc, 1, false, 0, 1, false, &frame);
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_calls == 1 && st.rx_calls_played == 1 && st.rx_calls_resumed == 1 && st.rx_late_entries == 0);
+	CHECK(sink_log.begins == 2 && V()->state != DMR_CALL_STATE_IDLE && V()->call_start_ms == started);
+
+	// Someone else in the gap: a new call
+	setup(&c);
+	dmr_call_reset_stats();
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	run_ms(DMR_CALL_FADE_MS + 200);
+	rx_call(other, 1, false, 0, 1, false, &frame);
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_calls == 2 && st.rx_calls_resumed == 0 && V()->caller.src == 9997004);
+
+	// The call was ended by its terminator: a new call, however soon
+	setup(&c);
+	dmr_call_reset_stats();
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	run_ms(DMR_CALL_FADE_MS + 200);
+	rx_call(lc, 1, false, 0, 1, false, &frame);
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_calls == 2 && st.rx_calls_resumed == 0);
+
+	// Too long a gap: a new call
+	setup(&c);
+	dmr_call_reset_stats();
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	run_ms(DMR_CALL_FADE_MS + DMR_CALL_RESUME_MS + 100);
+	rx_call(lc, 1, false, 0, 1, false, &frame);
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_calls == 2 && st.rx_calls_resumed == 0);
+}
+
+// A call heard as not ours, then the listen rules change with the RF the same (a scan stop on another channel of the
+// same frequency, color code and slot, or a new talk target): the call is ours now and plays from the next burst
+static void test_rx_recheck_on_configure(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	unsigned frame = 1;
+
+	setup(&c);
+	mk_lc(lc, 0, 1234, 9997030);
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	CHECK(V()->phase == DMR_CALL_PHASE_RX_BUSY && sink_log.begins == 0 && sink_log.frames == 0);
+	c.talk_target.id = 1234;
+	dmr_call_configure(&c);
+	dmr_call_poll(now);
+	CHECK(V()->phase == DMR_CALL_PHASE_RX_VOICE && sink_log.begins == 1 && V()->caller.dst == 1234);
+	for (int i = 0; i < 6; i++) {
+		rx_voice((uint8_t)i, 1, 0, DMR_SYNC_MS, &frame, i == 5 ? lc : NULL, false);
+		run_ms(60);
+	}
+	CHECK(sink_log.frames == 18 && sink_log.begins == 1);
+
+	// Back to a target that doesn't take it: the call keeps playing (no cut mid-over)
+	c.talk_target.id = TG_TALK;
+	dmr_call_configure(&c);
+	dmr_call_poll(now);
+	CHECK(V()->phase == DMR_CALL_PHASE_RX_VOICE && sink_log.ends == 0);
+
+	// A color code change is a new channel: the call ends, nothing is rechecked
+	setup(&c);
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	c.cc = 2;
+	c.talk_target.id = 1234;
+	dmr_call_configure(&c);
+	dmr_call_poll(now);
+	CHECK(V()->phase != DMR_CALL_PHASE_RX_VOICE && sink_log.begins == 0);
+}
+
+static void test_rx_filters(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	unsigned frame = 1;
+
+	// Wrong color code: nothing at all
+	setup(&c);
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	rx_call(lc, 2, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 0 && sink_log.frames == 0 && V()->serial > 0 && V()->last_heard_ms == 0);
+
+	// Talkgroup not listened to: the slot is busy but nothing is played
+	mk_lc(lc, 0, 1234, 9997030);
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	CHECK(V()->phase == DMR_CALL_PHASE_RX_BUSY && V()->caller.dst == 1234);
+	CHECK(sink_log.begins == 0 && sink_log.frames == 0);
+	CHECK(!dmr_call_channel_clear(now));
+	// ... and polite PTT is refused while it lasts
+	dmr_call_ptt(true);
+	run_ms(20);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_BUSY && sim.tx_begins == 0);
+	dmr_call_ptt(false);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, true);
+	run_ms(20);
+	CHECK(V()->phase == DMR_CALL_PHASE_IDLE && !V()->reply_active);
+	CHECK(!dmr_call_channel_clear(now));
+	run_ms(DMR_CALL_LBT_DMO_MS);
+	CHECK(dmr_call_channel_clear(now));
+
+	// Hear all plays it; all call always plays
+	c.listen.hear_all = true;
+	setup(&c);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 1 && sink_log.frames == 18);
+	c.listen.hear_all = false;
+	setup(&c);
+	mk_lc(lc, 0, DMR_ID_ALL_CALL, 9997030);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 1);
+
+	// Private call to us: played, reply goes back privately
+	setup(&c);
+	mk_lc(lc, DMR_FLCO_UNIT_VOICE, OWN_ID, 9997030);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 1 && sink_log.caller.to_us && !sink_log.caller.group && sink_log.frames == 18);
+	CHECK(V()->reply_active && V()->tx_target.id == 9997030 && V()->tx_target.private_call);
+	dmr_call_ptt(true);
+	run_ms(20);
+	uint8_t want[9];
+	mk_lc(want, DMR_FLCO_UNIT_VOICE, 9997030, OWN_ID);
+	CHECK(memcmp(sim.emb_lc, want, 9) == 0);
+	dmr_call_ptt(false);
+	run_ms(600);
+
+	// Private call to someone else: not played
+	setup(&c);
+	mk_lc(lc, DMR_FLCO_UNIT_VOICE, 9997002, 9997030);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 0);
+
+	// Group list by callback
+	setup(&c);
+	mk_lc(lc, 0, 777, 9997030);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 0);
+
+	// Our own call echoed by a repeater right behind our terminator: not played (a parrot's later answer is, below)
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(300);
+	dmr_call_ptt(false);
+	run_ms(400);
+	mk_lc(lc, 0, TG_TALK, OWN_ID);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 0);
+	// ... and its terminators never end someone else's call
+	c.rmo = true;
+	setup(&c);
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	uint8_t own[9];
+	mk_lc(own, 0, TG_TALK, OWN_ID);
+	run_ms(500);
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	rx_header(own, 1, 0, DMR_SYNC_BS, true);	// stale echo of our terminator
+	run_ms(20);
+	CHECK(V()->phase == DMR_CALL_PHASE_RX_VOICE);
+	// Through a repeater, a terminator that isn't this call's doesn't end it
+	uint8_t stranger[9];
+	mk_lc(stranger, 0, TG_TALK, 9999999);
+	rx_header(stranger, 1, 0, DMR_SYNC_BS, true);
+	run_ms(20);
+	CHECK(V()->phase == DMR_CALL_PHASE_RX_VOICE && V()->caller.src == 9997030);
+	// RMO: wrong timeslot is filtered
+	mk_lc(lc, 0, TG_LIST, 9997003);
+	dmr_burst_t b;
+	memset(&b, 0, sizeof(b));
+	b.kind = DMR_BURST_VOICE_LC_HEADER;
+	b.cc = 1;
+	b.ts = 2;
+	b.sync = DMR_SYNC_BS;
+	b.crc_ok = true;
+	b.len = 12;
+	dmr_lc_encode_full(lc, DMR_RS_MASK_VOICE_HEADER, b.payload);
+	sim_rx(&b);
+	run_ms(20);
+	CHECK(V()->caller.src == 9997030);
+}
+
+// Our call, ended: back to idle, so a call heard next is judged by the echo window, not as heard while keyed
+static void own_call_then_idle(void)
+{
+	dmr_call_ptt(true);
+	run_ms(300);
+	dmr_call_ptt(false);
+	for (int i = 0; i < 100 && V()->state != DMR_CALL_STATE_IDLE; i++)
+		run_ms(10);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE);
+}
+
+// A parrot answers a while after our call ends, from our own ID (#294): it plays, with and without hear all, its
+// terminator ends it, and a call from our ID with no call of ours before it (a cloned ID) plays too
+static void test_rx_own_id_parrot(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	unsigned frame = 1;
+
+	for (int hear_all = 0; hear_all < 2; hear_all++) {
+		c.listen.hear_all = hear_all;
+		setup(&c);
+		own_call_then_idle();
+		run_ms(1000);
+		mk_lc(lc, 0, TG_TALK, OWN_ID);
+		rx_call(lc, 1, true, 0, 1, true, &frame);	// a second after our terminator
+		CHECK(sink_log.begins == 1);
+		CHECK(sink_log.ends == 1 && V()->state == DMR_CALL_STATE_IDLE);
+	}
+	c.listen.hear_all = false;
+
+	// A parrot on a talk group we only hear by the listen list, on the other slot of the repeater
+	setup(&c);
+	mk_lc(lc, 0, TG_LIST, OWN_ID);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 1 && sink_log.ends == 1);
+
+	// The repeater's echo right behind our terminator is still dropped; just after the window it plays
+	setup(&c);
+	own_call_then_idle();
+	run_ms(DMR_CALL_OWN_ECHO_MS - 100);
+	mk_lc(lc, 0, TG_TALK, OWN_ID);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 0);
+	setup(&c);
+	own_call_then_idle();
+	run_ms(DMR_CALL_OWN_ECHO_MS + 50);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 1);
+
+	// A call cut short (the modem refused a burst) is echoed as well: dropped
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(300);
+	sim.reject_next = true;
+	run_ms(60);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED);
+	dmr_call_ptt(false);
+	run_ms(100);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 0);
+
+	// Our ID on a talk group we don't hear, with no key-up of ours (a clone, a parrot): not our echo, a call on the
+	// channel, so a polite radio waits for it as for any other
+	c.access = DMR_ACCESS_POLITE_CC;
+	c.access_wait_ms = 0;
+	setup(&c);
+	mk_lc(lc, 0, 555, OWN_ID);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+	run_ms(10);
+	CHECK(sink_log.begins == 0);
+	dmr_call_ptt(true);
+	run_ms(10);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_DENIED && V()->tx_error == DMR_TX_ERR_BUSY && sim.tx_begins == 0);
+	dmr_call_ptt(false);
+	run_ms(600);
+}
+
+static bool tg777(uint32_t tg, void *ctx) { (void)ctx; return tg == 777; }
+
+static void test_rx_group_callback(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	unsigned frame = 1;
+
+	c.listen.group_ok = tg777;
+	setup(&c);
+	mk_lc(lc, 0, 777, 9997030);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 1);
+}
+
+static void test_late_entry(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9], other[9];
+	unsigned frame = 1;
+
+	// Joined at burst C, no header: the call starts at F with the embedded LC, audio from F on
+	setup(&c);
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	rx_call(lc, 1, false, 2, 1, false, &frame);
+	CHECK(sink_log.begins == 1 && sink_log.caller.late_entry && sink_log.caller.src == 9997030);
+	CHECK(sink_log.frames == 3 && sink_log.seq[0] == 10);	// C, D, E were frames 1-9
+	rx_call(lc, 1, false, 0, 1, true, &frame);
+	CHECK(sink_log.frames == 21 && sink_log.losts == 0 && sink_log.ends == 1);
+
+	// A lone burst with an LC (noise, a stray) starts nothing
+	setup(&c);
+	rx_voice(5, 1, 0, DMR_SYNC_MS, &frame, lc, false);
+	run_ms(60);
+	CHECK(sink_log.begins == 0 && V()->state == DMR_CALL_STATE_IDLE);
+	run_ms(500);
+
+	// The LC with the first burst heard (the HR_C7000 reports voice only once it has the LC): held, and the call starts
+	// at the next burst with both played (HIL 2026-10-15: dropping it cost a superframe, 13 bursts instead of 18)
+	setup(&c);
+	unsigned first = frame;
+	rx_voice(0, 1, 0, DMR_SYNC_MS, &frame, lc, false);
+	run_ms(60);
+	CHECK(sink_log.begins == 0);
+	rx_voice(1, 1, 0, DMR_SYNC_MS, &frame, NULL, false);
+	run_ms(60);
+	CHECK(sink_log.begins == 1 && sink_log.caller.late_entry && sink_log.caller.src == 9997030);
+	CHECK(sink_log.frames == 6 && sink_log.seq[0] == (uint8_t)first && sink_log.losts == 0);
+	run_ms(500);
+
+	// ... but not when the next burst isn't the one after it (a stray, then another): nothing starts
+	setup(&c);
+	rx_voice(0, 1, 0, DMR_SYNC_MS, &frame, lc, false);
+	run_ms(60);
+	rx_voice(3, 1, 0, DMR_SYNC_MS, &frame, NULL, false);
+	run_ms(60);
+	rx_voice(4, 1, 0, DMR_SYNC_MS, &frame, NULL, false);
+	run_ms(60);
+	CHECK(sink_log.begins == 0 && V()->state == DMR_CALL_STATE_IDLE);
+	run_ms(500);
+
+	// The next call without a header and with the same LC as the last one (the same talker again): taken at its first
+	// complete embedded LC. A sticky LC buffer is the driver's to filter (lc_valid is this reception's LC); the stack
+	// used to wait for a second superframe on top (HIL 2026-10-10: a late entry lost a superframe more)
+	setup(&c);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 1);
+	run_ms(1000);
+	rx_call(lc, 1, false, 0, 1, false, &frame);
+	CHECK(sink_log.begins == 2 && V()->caller.late_entry && V()->state != DMR_CALL_STATE_IDLE);
+	rx_call(lc, 1, false, 0, 1, false, &frame);
+	CHECK(sink_log.begins == 2);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, true);
+	run_ms(500);
+
+	// A different LC than the stale one is taken at the first superframe
+	mk_lc(other, 0, TG_LIST, 9997004);
+	rx_call(other, 1, false, 0, 1, false, &frame);
+	CHECK(sink_log.begins == 3 && V()->caller.src == 9997004);
+
+	// New talker on the same call without a header (repeater): caller follows the embedded LC
+	mk_lc(lc, 0, TG_LIST, 9997005);
+	rx_call(lc, 1, false, 0, 1, false, &frame);
+	CHECK(sink_log.begins == 4 && V()->caller.src == 9997005 && V()->phase == DMR_CALL_PHASE_RX_VOICE);
+	// ... and to a TG we don't listen to: playing stops
+	mk_lc(lc, 0, 5555, 9997005);
+	rx_call(lc, 1, false, 0, 1, false, &frame);
+	CHECK(V()->phase == DMR_CALL_PHASE_RX_BUSY && sink_log.ends == 4);
+}
+
+static void test_alias_and_privacy(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9], ta[4][9];
+	unsigned frame = 1;
+	int n = mk_alias("Q0TEST Charlie", DMR_TA_ISO8, ta);
+
+	setup(&c);
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	// Talker alias in the following superframes' embedded LC (instead of the voice LC)
+	for (int sf = 0; sf < n; sf++)
+		for (int i = 0; i < 6; i++) {
+			rx_voice((uint8_t)i, 1, 0, DMR_SYNC_MS, &frame, i == 5 ? ta[sf] : NULL, false);
+			run_ms(60);
+		}
+	CHECK(strcmp(V()->caller.alias, "Q0TEST Charlie") == 0 && V()->caller.alias_complete);
+	CHECK(V()->caller.src == 9997030 && sink_log.begins == 1);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, true);
+	run_ms(20);
+	CHECK(strcmp(V()->last_heard.alias, "Q0TEST Charlie") == 0);
+
+	// PI set and no key: shown as encrypted, never played
+	setup(&c);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+	run_ms(60);
+	for (int i = 0; i < 6; i++) {
+		rx_voice((uint8_t)i, 1, 0, DMR_SYNC_MS, &frame, NULL, true);
+		run_ms(60);
+	}
+	CHECK(sink_log.begins == 1 && sink_log.frames == 0 && sink_log.losts == 18 && V()->caller.encrypted);
+}
+
+static unsigned privacy_calls;
+static void privacy_xor(uint8_t v[27], uint8_t index, bool tx, void *ctx)
+{
+	(void)ctx;
+	(void)tx;
+	privacy_calls++;
+	for (int i = 0; i < 27; i++)
+		v[i] ^= (uint8_t)(0x10 + index);
+}
+
+static void test_privacy_hook(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	unsigned frame = 1;
+
+	c.privacy = privacy_xor;
+	c.tx_fid = 0x10;
+	c.tx_svc = DMR_SVC_PRIVACY;
+	setup(&c);
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	lc[2] = DMR_SVC_PRIVACY;
+	rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+	run_ms(60);
+	rx_voice(0, 1, 0, DMR_SYNC_MS, &frame, NULL, true);
+	run_ms(60);
+	CHECK(sink_log.frames == 3 && sink_log.first[0] == (1 ^ 0x10) && privacy_calls == 1);
+
+	setup(&c);
+	privacy_calls = 0;
+	dmr_call_ptt(true);
+	run_ms(500);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(sim.air[0].payload[0] == 0 && sim.air[0].payload[1] == 0x10 && sim.air[0].payload[2] == DMR_SVC_PRIVACY);
+	CHECK(sim.air[3].kind == DMR_BURST_VOICE && sim.air[3].payload[9] == (2 ^ 0x10));
+	CHECK(privacy_calls > 0);
+}
+
+// An emergency call (docs/spec/dmr-emergency.md 3): the emergency service option in the voice LC headers, the embedded
+// LC and the terminator, sent with impolite access as the radio core sets it in emergency
+static void test_emergency_tx(void)
+{
+	dmr_call_config_t c = base_cfg();
+	c.tx_svc = DMR_SVC_EMERGENCY;
+	c.access = DMR_ACCESS_IMPOLITE;
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(500);
+	dmr_call_ptt(false);
+	run_ms(600);
+	int headers = 0, terminators = 0;
+	for (unsigned i = 0; i < sim.air_count; i++) {
+		if (sim.air[i].kind == DMR_BURST_VOICE_LC_HEADER) {
+			headers++;
+			CHECK(sim.air[i].payload[0] == DMR_FLCO_GROUP_VOICE && sim.air[i].payload[2] == DMR_SVC_EMERGENCY);
+		} else if (sim.air[i].kind == DMR_BURST_TERMINATOR_LC) {
+			terminators++;
+			CHECK(sim.air[i].payload[2] == DMR_SVC_EMERGENCY);
+		}
+	}
+	CHECK(headers == DMR_CALL_TX_HEADERS && terminators == 1);
+	CHECK(sim.emb_lc_set && sim.emb_lc[2] == DMR_SVC_EMERGENCY);
+	CHECK(sim.last_access == DMR_ACCESS_IMPOLITE);
+}
+
+static void test_impolite_over_call(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	unsigned frame = 1;
+
+	c.access = DMR_ACCESS_IMPOLITE;
+	setup(&c);
+	mk_lc(lc, 0, TG_LIST, 9997030);
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	CHECK(V()->phase == DMR_CALL_PHASE_RX_VOICE);
+	dmr_call_ptt(true);
+	run_ms(20);
+	// Keyed over the call: it ends here, and the reply goes to its TG
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && sink_log.ends == 1);
+	CHECK(V()->caller.dst == TG_LIST && sim.last_timing == DMR_TIMING_ALIGNED);
+	// Bursts heard while we transmit are ignored
+	rx_voice(0, 1, 0, DMR_SYNC_MS, &frame, NULL, false);
+	run_ms(20);
+	CHECK(sink_log.frames == 18 && V()->state == DMR_CALL_STATE_TX);
+	dmr_call_ptt(false);
+	run_ms(600);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE);
+
+	// Polite with a wait: keys once the call ends
+	c.access = DMR_ACCESS_POLITE_CC;
+	c.access_wait_ms = 2000;
+	setup(&c);
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	dmr_call_ptt(true);
+	run_ms(100);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_ACCESS && V()->state == DMR_CALL_STATE_RX && sim.tx_begins == 0);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, true);
+	run_ms(30);
+	CHECK(V()->phase == DMR_CALL_PHASE_TX_VOICE && sim.tx_begins == 1);
+	dmr_call_ptt(false);
+	run_ms(600);
+}
+
+// Through a repeater, bursts of two talkers interleaved: a on slot ts_a, b (may be NULL) on the other, 30 ms apart
+static void rx_two_slots(const uint8_t a[9], uint8_t cc_a, int8_t ts_a, const uint8_t *b, unsigned *frame)
+{
+	int8_t ts_b = ts_a == 1 ? 2 : 1;
+
+	for (int h = 0; h < 3; h++) {
+		rx_header(a, cc_a, ts_a, DMR_SYNC_BS, false);
+		run_ms(30);
+		if (b)
+			rx_header(b, 1, ts_b, DMR_SYNC_BS, false);
+		run_ms(30);
+	}
+	for (int i = 0; i < 6; i++) {
+		rx_voice((uint8_t)i, cc_a, ts_a, DMR_SYNC_BS, frame, i == 5 ? a : NULL, false);
+		run_ms(30);
+		if (b)
+			rx_voice((uint8_t)i, 1, ts_b, DMR_SYNC_BS, frame, i == 5 ? b : NULL, false);
+		run_ms(30);
+	}
+}
+
+// Digital monitor through a repeater: either slot and any color code, one call at a time; PTT keeps the channel's
+static void test_monitor_both_slots(void)
+{
+	dmr_call_config_t c = base_cfg();
+	dmr_call_stats_t st;
+	uint8_t lc[9], other[9];
+	unsigned frame = 1;
+
+	c.rmo = true;
+	c.listen.hear_all = true;
+	mk_lc(lc, 0, 3100, 3101001);
+	mk_lc(other, 0, 91, 3101002);
+
+	// Hear all alone: the other slot is dropped, the modem keeps to ours
+	setup(&c);
+	CHECK(sim.locked_ts == 1 && sim.cc_filter == 1);
+	rx_two_slots(lc, 1, 2, NULL, &frame);
+	dmr_call_get_stats(&st);
+	CHECK(sink_log.begins == 0 && st.rx_ts_dropped > 0);
+
+	// Both slots and any color code: a call on slot 2, CC 5 plays and is shown as such
+	c.listen.both_ts = c.listen.any_cc = true;
+	setup(&c);
+	CHECK(sim.locked_ts == 0 && sim.cc_filter == -1);
+	rx_two_slots(lc, 5, 2, NULL, &frame);
+	CHECK(sink_log.begins == 1 && V()->state == DMR_CALL_STATE_RX && V()->caller.src == 3101001);
+	CHECK(V()->rx_ts == 2 && V()->rx_cc == 5 && V()->ts == 1 && V()->cc == 1);
+
+	// The first call heard keeps the voice: a talker starting on slot 1 meanwhile doesn't take over
+	setup(&c);
+	rx_two_slots(lc, 1, 2, other, &frame);
+	dmr_call_get_stats(&st);
+	CHECK(sink_log.begins == 1 && V()->caller.src == 3101001 && V()->rx_ts == 2 && st.rx_ts_dropped > 0);
+
+	// Monitor off: back to our slot and color code
+	c.listen.both_ts = c.listen.any_cc = false;
+	dmr_call_configure(&c);
+	CHECK(sim.locked_ts == 1 && sim.cc_filter == 1);
+
+	// Monitor on during a call heard as not ours: it plays at once, not cut and found again by late entry
+	uint8_t tg[9];
+
+	mk_lc(tg, 0, 4444, 3101003);
+	c.listen.hear_all = false;
+	setup(&c);
+	rx_two_slots(tg, 1, 1, NULL, &frame);
+	CHECK(V()->phase == DMR_CALL_PHASE_RX_BUSY && sink_log.begins == 0);
+	c.listen.hear_all = c.listen.both_ts = c.listen.any_cc = true;
+	dmr_call_configure(&c);
+	run_ms(30);
+	CHECK(V()->phase == DMR_CALL_PHASE_RX_VOICE && sink_log.begins == 1 && sink_log.ends == 0);
+	CHECK(sim.locked_ts == 0 && sim.cc_filter == -1);
+	// ... and monitor off after it keeps its reply window
+	rx_header(tg, 1, 1, DMR_SYNC_BS, true);
+	run_ms(30);
+	CHECK(V()->reply_active && V()->tx_target.id == 4444);
+	c.listen.hear_all = c.listen.both_ts = c.listen.any_cc = false;
+	dmr_call_configure(&c);
+	CHECK(V()->reply_active && V()->tx_target.id == 4444 && sim.locked_ts == 1);
+
+	// Late entry with both slots busy: a burst held with its LC on one slot never pairs with the other slot's next
+	c.listen.hear_all = c.listen.both_ts = c.listen.any_cc = true;
+	setup(&c);
+	rx_voice(2, 1, 1, DMR_SYNC_BS, &frame, lc, false);
+	run_ms(30);
+	rx_voice(3, 1, 2, DMR_SYNC_BS, &frame, NULL, false);
+	run_ms(30);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE && sink_log.begins == 0);
+	rx_voice(3, 1, 1, DMR_SYNC_BS, &frame, NULL, false);
+	run_ms(30);
+	CHECK(V()->state == DMR_CALL_STATE_RX && V()->rx_ts == 1 && sink_log.begins == 1);
+
+	// Late entry at burst A, whose color code the modem reports is junk: the call's code comes from B-F. Simplex
+	// without TDMA direct mode sync: the slot the modem gives is not known
+	c = base_cfg();
+	c.listen.hear_all = c.listen.both_ts = c.listen.any_cc = true;
+	setup(&c);
+	rx_voice(4, 5, 2, DMR_SYNC_MS, &frame, NULL, false);
+	run_ms(60);
+	rx_voice(5, 5, 2, DMR_SYNC_MS, &frame, NULL, false);
+	run_ms(60);
+	rx_voice(0, 9, 2, DMR_SYNC_MS, &frame, lc, false);
+	run_ms(60);
+	CHECK(V()->state == DMR_CALL_STATE_RX && V()->rx_cc == c.cc && V()->rx_ts == 0);
+	rx_voice(1, 5, 2, DMR_SYNC_MS, &frame, NULL, false);
+	run_ms(60);
+	CHECK(V()->rx_cc == 5 && V()->rx_ts == 0);
+}
+
+static void test_modem_color_code(void)
+{
+	// The channel's TX code survives each reason for listening beyond it, on start and reconfigure.
+	for (int mode = 0; mode < 4; mode++) {
+		dmr_call_config_t c = base_cfg();
+		c.listen.hear_all = mode == 0;
+		c.listen.any_cc = mode == 1;
+		if (mode == 2)
+			c.access = DMR_ACCESS_POLITE_ALL;
+		if (mode == 3) {
+			c.sfr_user = true;
+			c.cc2 = 5;
+		}
+		setup(&c);
+		CHECK(sim.cfg.cc == 1 && sim.cc_filter == (mode == 0 ? 1 : -1));
+		c.cc = 3;
+		dmr_call_configure(&c);
+		CHECK(sim.cfg.cc == 3 && sim.cc_filter == (mode == 0 ? 3 : -1));
+		dmr_call_stop();
+		CHECK(dmr_call_start());
+		CHECK(sim.cfg.cc == 3 && sim.cc_filter == (mode == 0 ? 3 : -1));
+		c = base_cfg();
+		dmr_call_configure(&c);
+		CHECK(sim.cfg.cc == 1 && sim.cc_filter == 1);
+		dmr_call_stop();
+	}
+}
+
+static void test_reconfigure(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	unsigned frame = 1;
+
+	setup(&c);
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	CHECK(V()->state == DMR_CALL_STATE_RX);
+	c.cc = 3;
+	dmr_call_configure(&c);
+	run_ms(10);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE && sink_log.ends == 1 && sim.cc_filter == 3 && V()->cc == 3);
+	c.listen.any_cc = true;
+	dmr_call_configure(&c);
+	CHECK(sim.cc_filter == -1);
+	rx_call(lc, 7, true, 0, 1, false, &frame);
+	CHECK(V()->state == DMR_CALL_STATE_RX && V()->rx_cc == 7 && V()->cc == 3);	// the channel's stays for PTT
+
+	dmr_call_stop();
+	CHECK(!sim.started);
+	dmr_call_ptt(true);
+	run_ms(20);
+	CHECK(V()->tx_error == DMR_TX_ERR_NO_MODEM && V()->phase == DMR_CALL_PHASE_TX_DENIED);
+	dmr_call_ptt(false);
+	run_ms(20);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Voice call features: talker alias TX, PI headers, emergency, private calls and their reply window, basic privacy
+
+// The embedded LC of every whole superframe on air, in order (reassembled from the B-E fragments)
+static int air_superframe_lcs(uint8_t out[][9], int max)
+{
+	dmr_emb_rx_t rx;
+	int n = 0;
+
+	dmr_emb_rx_reset(&rx);
+	for (unsigned i = 0; i < sim.air_count && n < max; i++) {
+		sim_air_t *a = &sim.air[i];
+
+		if (a->kind == DMR_BURST_VOICE && a->voice_index >= 1 && a->voice_index <= 4 &&
+		    dmr_emb_rx_push(&rx, a->emb, a->lcss, out[n]))
+			n++;
+	}
+	return n;
+}
+
+static void test_tx_alias(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9], ta[4][9], got[16][9];
+	dmr_call_stats_t st;
+
+	strcpy(c.tx_alias, "Q0TEST Charlie");	// ISO 8-bit: header and two blocks
+	c.tx_alias_format = DMR_TA_ISO8;
+	setup(&c);
+	int n = dmr_ta_encode(c.tx_alias, DMR_TA_ISO8, ta);
+	CHECK(n == 3);
+	dmr_call_ptt(true);
+	run_ms(360 * 9);
+	dmr_call_ptt(false);
+	run_ms(1200);
+	mk_lc(lc, 0, TG_TALK, OWN_ID);
+	int sfs = air_superframe_lcs(got, 16);
+	CHECK(sfs >= 9);
+	// LC, header, LC, block 1, LC, block 2, LC, header, LC ...
+	for (int k = 0; k < sfs; k++) {
+		const uint8_t *want = (k & 1) ? ta[(k / 2) % n] : lc;
+
+		CHECK(memcmp(got[k], want, 9) == 0);
+	}
+	// An independent receiver (the stack's own decoder) gets the text back
+	dmr_ta_t rx;
+	dmr_ta_reset(&rx);
+	for (int k = 1; k < sfs; k += 2)
+		dmr_ta_push(&rx, got[k]);
+	CHECK(rx.complete && strcmp(rx.text, "Q0TEST Charlie") == 0);
+	dmr_call_get_stats(&st);
+	CHECK(st.tx_alias_lcs == (uint32_t)(sfs / 2));
+
+	// 7-bit, the longest alias: header and three blocks
+	n = dmr_ta_encode("ABCDEFGHIJKLMNOPQRSTUVWXYZ01234567", DMR_TA_7BIT, ta);
+	dmr_ta_reset(&rx);
+	for (int k = 0; k < n; k++)
+		dmr_ta_push(&rx, ta[k]);
+	CHECK(n == 4 && rx.complete && strcmp(rx.text, "ABCDEFGHIJKLMNOPQRSTUVWXYZ01234") == 0);
+	CHECK(dmr_ta_encode("", DMR_TA_ISO8, ta) == 0);
+
+	// No alias: the voice LC in every superframe
+	c = base_cfg();
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(360 * 4);
+	dmr_call_ptt(false);
+	run_ms(1200);
+	sfs = air_superframe_lcs(got, 16);
+	CHECK(sfs >= 4);
+	for (int k = 0; k < sfs; k++)
+		CHECK(memcmp(got[k], lc, 9) == 0);
+}
+
+// Talker alias formats a receiver must take (TS 102 361-2 7.2.18)
+static void ta_build(uint8_t format, uint8_t length, const uint8_t *data, int bits, uint8_t lcs[4][9])
+{
+	uint8_t stream[28] = { 0 };
+
+	for (int i = 0; i < bits; i++)
+		if (data[i / 8] & (0x80 >> (i % 8)))
+			stream[(i + (format ? 1 : 0)) / 8] |= (uint8_t)(0x80 >> ((i + (format ? 1 : 0)) % 8));
+	memset(lcs, 0, 4 * 9);
+	lcs[0][0] = DMR_FLCO_TA_HEADER;
+	lcs[0][2] = (uint8_t)((format << 6) | (length << 1) | (stream[0] >> 7));
+	for (int i = 0; i < 48; i++)
+		if (stream[(1 + i) / 8] & (0x80 >> ((1 + i) % 8)))
+			lcs[0][3 + i / 8] |= (uint8_t)(0x80 >> (i % 8));
+	for (int b = 1; b <= 3; b++) {
+		lcs[b][0] = (uint8_t)(DMR_FLCO_TA_BLOCK1 + b - 1);
+		for (int i = 0; i < 56; i++) {
+			int at = 49 + (b - 1) * 56 + i;
+			if (stream[at / 8] & (0x80 >> (at % 8)))
+				lcs[b][2 + i / 8] |= (uint8_t)(0x80 >> (i % 8));
+		}
+	}
+}
+
+static void test_alias_formats(void)
+{
+	uint8_t lcs[4][9];
+	dmr_ta_t ta;
+
+	// UTF-8 "Zoë K1" (length 6 characters, 7 bytes): the two-byte sequence shows as one '?'
+	static const uint8_t utf8[] = { 'Z', 'o', 0xC3, 0xAB, ' ', 'K', '1' };
+	ta_build(DMR_TA_UTF8, 6, utf8, 8 * sizeof(utf8), lcs);
+	dmr_ta_reset(&ta);
+	dmr_ta_push(&ta, lcs[0]);
+	CHECK(strcmp(ta.text, "Zo? K") == 0 && !ta.complete);	// header: 6 bytes, the "1" still missing
+	dmr_ta_push(&ta, lcs[1]);
+	CHECK(strcmp(ta.text, "Zo? K1") == 0 && ta.complete);
+	// ... and a sender counting bytes (length 7): the zero padding after the text ends it
+	ta_build(DMR_TA_UTF8, 7, utf8, 8 * sizeof(utf8), lcs);
+	dmr_ta_reset(&ta);
+	dmr_ta_push(&ta, lcs[0]);
+	CHECK(!ta.complete);
+	dmr_ta_push(&ta, lcs[1]);
+	CHECK(strcmp(ta.text, "Zo? K1") == 0 && ta.complete);
+	// ... or, with no padding to see (a 27-byte alias announced as 31), once all four parts are in
+	static const uint8_t full[27] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	uint8_t f27[27];
+	memcpy(f27, full, 26);
+	f27[26] = 'z';
+	ta_build(DMR_TA_UTF8, 31, f27, 8 * 27, lcs);
+	dmr_ta_reset(&ta);
+	for (int k = 0; k < 3; k++)
+		dmr_ta_push(&ta, lcs[k]);
+	CHECK(!ta.complete);
+	dmr_ta_push(&ta, lcs[3]);
+	CHECK(ta.complete && strcmp(ta.text, "ABCDEFGHIJKLMNOPQRSTUVWXYZz") == 0);
+
+	// UTF-16 BE "AB" + a surrogate pair + "C": 4 characters
+	static const uint8_t utf16[] = { 0, 'A', 0, 'B', 0xD8, 0x3D, 0xDE, 0x00, 0, 'C' };
+	ta_build(DMR_TA_UTF16, 4, utf16, 8 * sizeof(utf16), lcs);
+	dmr_ta_reset(&ta);
+	dmr_ta_push(&ta, lcs[0]);
+	CHECK(strcmp(ta.text, "AB") == 0 && !ta.complete);
+	dmr_ta_push(&ta, lcs[1]);
+	CHECK(strcmp(ta.text, "AB?C") == 0 && ta.complete);
+
+	// ISO 8-bit with a Latin-1 letter
+	static const uint8_t iso[] = { 'J', 0xE9, 'r', 0xF4, 'm', 'e' };
+	ta_build(DMR_TA_ISO8, 6, iso, 8 * sizeof(iso), lcs);
+	dmr_ta_reset(&ta);
+	dmr_ta_push(&ta, lcs[0]);
+	CHECK(strcmp(ta.text, "J?r?me") == 0 && ta.complete);
+}
+
+static void rx_pi_header_burst(const uint8_t info[10], uint8_t cc, bool good_crc)
+{
+	dmr_burst_t b;
+
+	memset(&b, 0, sizeof(b));
+	b.kind = DMR_BURST_PI_HEADER;
+	b.sync = DMR_SYNC_MS;
+	b.cc = cc;
+	b.crc_ok = good_crc;
+	b.in_step = true;
+	b.len = 12;
+	memcpy(b.payload, info, 10);
+	uint16_t crc = (uint16_t)(dmr_crc_ccitt(info, 10) ^ DMR_CRC_MASK_PI);
+	b.payload[10] = (uint8_t)(crc >> 8);
+	b.payload[11] = (uint8_t)(good_crc ? crc : ~crc);
+	sim_rx(&b);
+}
+
+static void test_pi_header_and_emergency(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	static const uint8_t info[10] = { 0x21, 0x10, 0x05, 0x34, 0x56, 0x78, 0x00, 0x00, 0x5B, 0x00 };
+	unsigned frame = 1;
+	dmr_call_stats_t st;
+
+	// Header, PI header, voice: the call is marked protected with the PI octets; no key, so nothing plays
+	setup(&c);
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+	run_ms(60);
+	CHECK(!V()->caller.encrypted && !V()->caller.pi_header);
+	rx_pi_header_burst(info, 1, false);	// a bad CRC is ignored
+	run_ms(60);
+	CHECK(!V()->caller.pi_header);
+	rx_pi_header_burst(info, 1, true);
+	run_ms(60);
+	CHECK(V()->caller.pi_header && V()->caller.encrypted && V()->caller.pi_alg == 0x21 && V()->caller.pi_key == 0x05);
+	rx_call(lc, 1, false, 0, 1, true, &frame);
+	CHECK(sink_log.frames == 0 && V()->last_heard.pi_header);
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_pi_headers == 1 && st.rx_encrypted_calls == 1 && st.rx_calls == 1);
+
+	// PI header heard, voice LC header missed: the late entry takes it
+	run_ms(1000);
+	mk_lc(lc, 0, TG_TALK, 9997006);
+	rx_pi_header_burst(info, 1, true);
+	run_ms(60);
+	rx_call(lc, 1, false, 0, 1, false, &frame);
+	CHECK(V()->caller.late_entry && V()->caller.pi_header && V()->caller.encrypted);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, true);
+	run_ms(500);
+
+	// Emergency service option: flagged for the screens and counted
+	setup(&c);
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	lc[2] = DMR_SVC_EMERGENCY;
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	CHECK(V()->caller.emergency && !V()->caller.encrypted && sink_log.frames == 18);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, true);
+	run_ms(60);
+	CHECK(V()->last_heard.emergency);
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_emergency_calls == 1);
+	// ... and an emergency call to a talkgroup we don't listen to is still shown (busy), with the flag
+	mk_lc(lc, 0, 5555, 9997030);
+	lc[2] = DMR_SVC_EMERGENCY;
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	CHECK(V()->phase == DMR_CALL_PHASE_RX_BUSY && V()->caller.emergency);
+}
+
+static void test_private_calls(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	unsigned frame = 1;
+	dmr_call_stats_t st;
+
+	c.reply_window_s = 4;
+	c.reply_window_private_s = 12;
+	setup(&c);
+	// To us: played, reply target is the caller (private) for the private window
+	mk_lc(lc, DMR_FLCO_UNIT_VOICE, OWN_ID, 9997030);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(sink_log.begins == 1 && sink_log.caller.to_us && !sink_log.caller.group && sink_log.frames == 18);
+	CHECK(V()->reply_active && V()->tx_target.id == 9997030 && V()->tx_target.private_call && V()->reply_s == 12);
+	// PTT in the window: a private call back
+	dmr_call_ptt(true);
+	run_ms(400);
+	dmr_call_ptt(false);
+	run_ms(800);
+	CHECK(sim.air[0].payload[0] == DMR_FLCO_UNIT_VOICE);
+	dmr_lc_t l;
+	dmr_lc_unpack(sim.air[0].payload, &l);
+	CHECK(l.dst == 9997030 && l.src == OWN_ID);
+	CHECK(V()->reply_active && V()->reply_s == 12);	// our call restarted the private window
+	run_ms(13000);
+	CHECK(!V()->reply_active);
+
+	// To someone else: shown (busy) while it lasts, not played, no reply window
+	mk_lc(lc, DMR_FLCO_UNIT_VOICE, 9997007, 9997030);
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	CHECK(V()->phase == DMR_CALL_PHASE_RX_BUSY && V()->caller.dst == 9997007 && !V()->caller.to_us &&
+	      !V()->caller.group);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, true);
+	run_ms(60);
+	CHECK(sink_log.begins == 1 && !V()->reply_active);
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_private_calls == 2 && st.rx_calls_played == 1);
+
+	// A group call uses the group window
+	mk_lc(lc, 0, TG_LIST, 9997030);
+	rx_call(lc, 1, true, 0, 1, true, &frame);
+	CHECK(V()->reply_active && !V()->tx_target.private_call && V()->reply_s == 4);
+
+	// Private talk target (a contact or a typed ID): the header and terminator are unit to unit
+	c = base_cfg();
+	c.talk_target.id = 9997030;
+	c.talk_target.private_call = true;
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(400);
+	dmr_call_ptt(false);
+	run_ms(800);
+	unsigned v;
+	mk_lc(lc, DMR_FLCO_UNIT_VOICE, 9997030, OWN_ID);
+	check_tx_burst_sequence(0, lc, &v);
+}
+
+// Basic privacy end to end through the real hook: TX scrambles the voice parameter bits, a receiver with the key gets
+// the encoder's frames back, one without it never plays them
+static void test_basic_privacy(void)
+{
+	static dmrPrivacyKey_t key = { DMR_PRIVACY_MOTOROLA_BP, 179 };
+	dmr_call_config_t c = base_cfg();
+
+	c.privacy = dmrPrivacyCallHook;
+	c.privacy_ctx = &key;
+	c.tx_fid = dmrPrivacyFID(key.type, 0);
+	c.tx_svc = dmrPrivacyServiceOptions(key.type, 0);
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(800);
+	dmr_call_ptt(false);
+	run_ms(800);
+	CHECK(sim.air[0].payload[1] == 0x10 && sim.air[0].payload[2] == DMR_SVC_PRIVACY);
+
+	// The source's frames are not valid AMBE FEC words, so compare the 49 parameter bits after the FEC decode
+	unsigned voice = 0, same = 0;
+	for (unsigned i = 0; i < sim.air_count; i++) {
+		sim_air_t *a = &sim.air[i];
+		if (a->kind != DMR_BURST_VOICE)
+			continue;
+		uint8_t clear[27], bits_air[49], bits_clear[49];
+		for (int f = 0; f < 3; f++) {
+			unsigned n = voice * 3 + (unsigned)f;
+			uint8_t src_frame[9], p[49];
+			src_frame[0] = (uint8_t)(n + 1);
+			for (int k = 1; k < 9; k++)
+				src_frame[k] = (uint8_t)(0xA0 + k);
+			// the hook takes the encoder's 49 bits as they are (no correction on TX) and re-encodes them
+			dmrPrivacyAmbeExtract(src_frame, p);
+			ambeFecEncode(p, &clear[f * 9]);
+		}
+		// Descramble what went on air with the key (as a receiver would) and compare with the clear frames
+		uint8_t back[27];
+		memcpy(back, a->payload, 27);
+		dmrPrivacyCallHook(back, a->voice_index, false, &key);
+		for (int f = 0; f < 3; f++) {
+			ambeFecDecode(&back[f * 9], bits_air, NULL);
+			ambeFecDecode(&clear[f * 9], bits_clear, NULL);
+			if (memcmp(bits_air, bits_clear, 49) == 0)
+				same++;
+		}
+		CHECK(memcmp(a->payload, clear, 27) != 0);	// scrambled on air
+		voice++;
+	}
+	CHECK(voice >= 12 && same == voice * 3);
+
+	// RX: a call scrambled with key 179; played (descrambled) with the key, dropped without
+	uint8_t lc[9], plain[27], scr[27], p49[49];
+	for (int f = 0; f < 3; f++) {
+		for (int k = 0; k < 49; k++)
+			p49[k] = (uint8_t)((k * 7 + f) & 1);
+		ambeFecEncode(p49, &plain[f * 9]);
+	}
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	lc[1] = 0x10;
+	lc[2] = DMR_SVC_PRIVACY;
+	for (int pass = 0; pass < 2; pass++) {
+		c = base_cfg();
+		if (pass == 0) {
+			c.privacy = dmrPrivacyCallHook;
+			c.privacy_ctx = &key;
+		}
+		setup(&c);
+		rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+		run_ms(60);
+		for (int i = 0; i < 6; i++) {
+			dmr_burst_t b;
+			memset(&b, 0, sizeof(b));
+			b.kind = DMR_BURST_VOICE;
+			b.voice_index = (uint8_t)i;
+			b.sync = i == 0 ? DMR_SYNC_MS : DMR_SYNC_NONE;
+			b.cc = 1;
+			b.crc_ok = true;
+			b.in_step = true;
+			b.len = 27;
+			memcpy(scr, plain, 27);
+			dmrPrivacyCallHook(scr, (uint8_t)i, true, &key);
+			memcpy(b.payload, scr, 27);
+			sim_rx(&b);
+			run_ms(60);
+		}
+		CHECK(V()->caller.encrypted);
+		if (pass == 0)
+			CHECK(sink_log.frames == 18 && sink_log.losts == 0 && memcmp(sink_log.first, plain, 9) == 0);
+		else
+			CHECK(sink_log.frames == 0 && sink_log.losts == 18);
+	}
+
+	// A RAS call with no usable LC. B signals privacy, F and both A bursts do not. The second
+	// superframe must still use Basic Privacy, even on a color code and slot other than our own.
+	c = base_cfg();
+	c.listen.hear_all = c.listen.any_cc = c.listen.both_ts = true;
+	c.privacy = dmrPrivacyCallHook;
+	c.privacy_ctx = &key;
+	setup(&c);
+	dmr_burst_t b = { .kind = DMR_BURST_VOICE, .cc = 9, .ts = 2, .crc_ok = true, .in_step = true, .len = 27 };
+	for (unsigned i = 0; i < 12; i++) {
+		b.voice_index = (uint8_t)(i % 6);
+		b.sync = b.voice_index == 0 ? DMR_SYNC_BS : DMR_SYNC_NONE;
+		b.pi = i == 1;
+		memcpy(b.payload, plain, 27);
+		dmrPrivacyCallHook(b.payload, b.voice_index, true, &key);
+		sim_rx(&b);
+		run_ms(60);
+	}
+	CHECK(V()->caller.encrypted && V()->caller.src == 0 && V()->caller.dst == 0);
+	CHECK(sink_log.frames == 21 && !memcmp(sink_log.first, plain, 9) && !memcmp(sink_log.last, plain + 18, 9));
+	run_ms(DMR_CALL_FADE_MS + 60);
+	b.ts = 1;
+	b.cc = 3;
+	memcpy(b.payload, plain, 27);
+	for (unsigned i = 0; i < 6; i++) {
+		b.voice_index = (uint8_t)i;
+		b.sync = i == 0 ? DMR_SYNC_BS : DMR_SYNC_NONE;
+		sim_rx(&b);
+		run_ms(60);
+	}
+	CHECK(!V()->caller.encrypted && sink_log.frames == 24 && !memcmp(sink_log.last, plain + 18, 9));
+
+	// The repeater omits the privacy indication altogether: use the operator's BP key only on the configured slot/CC.
+	c.basic_ras = true;
+	setup(&c);
+	b.cc = c.cc;
+	b.ts = (int8_t)c.ts;
+	for (unsigned i = 0; i < 6; i++) {
+		b.voice_index = (uint8_t)i;
+		b.sync = i == 0 ? DMR_SYNC_BS : DMR_SYNC_NONE;
+		memcpy(b.payload, plain, 27);
+		dmrPrivacyCallHook(b.payload, b.voice_index, true, &key);
+		sim_rx(&b);
+		run_ms(60);
+	}
+	CHECK(V()->caller.encrypted && sink_log.frames == 3 && !memcmp(sink_log.first, plain, 9));
+}
+
+
+#if CONFIG_AIR_AES
+// AES-256 and ARC4 end to end (core/dmr/dmrAes.h): TX sends its voice LC headers, a PI header with the key ID and a fresh MI,
+// then encrypted bursts. Those bursts decrypt to the encoder's frames; a receiver with the key and key ID plays them,
+// one with another key ID or without the key never does. The key ID without its key refuses PTT. Late entry: a
+// receiver that never heard the PI header starts from burst F's single block and the superframes' MI fragments
+static void test_cipher(uint8_t alg)
+{
+	static uint8_t key[32];
+	static uint8_t air_v[40][27], air_i[40], pi[12];
+	dmr_call_config_t c = base_cfg();
+	unsigned nv = 0, at_pi = 0, at_voice = 0;
+
+	for (int i = 0; i < 32; i++)
+		key[i] = (uint8_t)(i * 7 + 1);
+	c.cipher_key = key;
+	c.cipher_alg = alg;
+	c.cipher_kid = 14;
+	c.tx_fid = 0x10;
+	c.tx_svc = DMR_SVC_PRIVACY;
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(800);
+	dmr_call_ptt(false);
+	run_ms(800);
+	for (unsigned i = 0; i < sim.air_count; i++) {
+		sim_air_t *a = &sim.air[i];
+
+		if (a->kind == DMR_BURST_PI_HEADER && !at_pi) {
+			at_pi = i;
+			memcpy(pi, a->payload, 12);
+		}
+		if (a->kind == DMR_BURST_VOICE && nv < 40) {
+			if (!at_voice)
+				at_voice = i;
+			memcpy(air_v[nv], a->payload, 27);
+			air_i[nv++] = a->voice_index;
+		}
+	}
+	// The PI header: after the LC headers, before burst A; FID 0x10, algorithm, key ID 14, an MI, CRC masked 0x6969
+	uint8_t kid;
+	uint32_t mi;
+	uint16_t crc = (uint16_t)(dmr_crc_ccitt(pi, 10) ^ DMR_CRC_MASK_PI);
+
+	CHECK(at_pi > 0 && at_pi < at_voice && sim.air[at_pi - 1].kind == DMR_BURST_VOICE_LC_HEADER);
+	CHECK(dmrVoiceCipherPiParse(pi, alg, &kid, &mi) && kid == 14 && mi != 0 && pi[10] == (uint8_t)(crc >> 8) && pi[11] == (uint8_t)crc);
+	CHECK(sim.air[0].payload[1] == 0x10 && sim.air[0].payload[2] == DMR_SVC_PRIVACY);
+	CHECK(nv >= 12 && air_i[0] == 0);
+
+	// Burst F carries the single block (key ID 14 and algorithm), and the first
+	// superframe's fragments decode to the next superframe's MI
+	{
+		uint8_t frag[6][3];
+		uint32_t mi2;
+		unsigned f_seen = 0, sb_seen = 0;
+
+		for (unsigned i = 0; i < sim.air_count && f_seen < 6; i++) {
+			sim_air_t *a = &sim.air[i];
+
+			if (a->kind != DMR_BURST_VOICE)
+				continue;
+			dmrAesLeCollect(a->payload, a->voice_index, frag);
+			f_seen++;
+			if (a->voice_index == 5) {
+				uint16_t info;
+
+				CHECK(a->sb_set);
+				CHECK(dmrFecSbDecode(((uint32_t)a->sb[0] << 24) | ((uint32_t)a->sb[1] << 16) |
+						     ((uint32_t)a->sb[2] << 8) | a->sb[3], &info) == 0 &&
+				      info == (uint16_t)((14 << 3) | (alg & 7)));
+				sb_seen++;
+			}
+		}
+		CHECK(f_seen == 6 && sb_seen == 1);
+		CHECK(dmrAesLeDecode(frag, &mi2) && mi2 == dmrVoiceCipherNextMi(alg, mi));
+	}
+
+	// Decrypted with the key and the PI header's MI: the encoder's frames (compared after the FEC decode, as the
+	// source's frames are not valid FEC words)
+	dmr_aes_t rx;
+	unsigned same = 0;
+	uint8_t first[9] = { 0 }, last[9] = { 0 };
+
+	dmrVoiceCipherStart(&rx, alg, key, mi);
+	for (unsigned v = 0; v < nv; v++) {
+		uint8_t back[27];
+
+		memcpy(back, air_v[v], 27);
+		CHECK(dmrAesBurst(&rx, back, air_i[v], 0, dmr_ambe_silence));
+		for (int f = 0; f < 3; f++) {
+			unsigned n = v * 3 + (unsigned)f;
+			uint8_t src_frame[9], p[49], q[49];
+
+			src_frame[0] = (uint8_t)(n + 1);
+			for (int k = 1; k < 9; k++)
+				src_frame[k] = (uint8_t)(0xA0 + k);
+			ambeFecDecode(src_frame, p, NULL);
+			ambeFecDecode(&back[f * 9], q, NULL);
+			// The late-entry nibbles sit in the frames' last four voice bits (45-48), so those are the LE
+			// fragments on air, not the source's bits: compare the voice bits before them
+			same += memcmp(p, q, 45) == 0;
+		}
+		CHECK(memcmp(back, air_v[v], 27) != 0);	// encrypted on air
+		if (v == 0)
+			memcpy(first, back, 9);
+		memcpy(last, &back[18], 9);
+	}
+	CHECK(same == nv * 3);
+
+	// The same bursts into a receiver: the key and key ID play them all; another key ID or no key, none
+	for (int pass = 0; pass < 5; pass++) {
+		bool ras = pass == 3;
+		uint8_t lc[9];
+
+		c = base_cfg();
+		c.cipher_alg = alg;
+		c.cipher_kid = pass == 1 ? 15 : 14;
+		c.cipher_key = pass == 2 ? NULL : key;
+		c.listen.hear_all = c.listen.any_cc = c.listen.both_ts = ras;
+		c.rmo = ras;
+		setup(&c);
+		mk_lc(lc, 0, TG_TALK, 9997030);
+		lc[1] = 0x10;
+		lc[2] = DMR_SVC_PRIVACY;
+		if (!ras)
+			rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+		run_ms(30);
+
+		dmr_burst_t b;
+
+		memset(&b, 0, sizeof(b));
+		b.kind = DMR_BURST_PI_HEADER;
+		b.cc = ras ? 9 : 1;
+		b.ts = ras ? 2 : 0;
+		b.crc_ok = true;
+		b.in_step = true;
+		b.len = 12;
+		memcpy(b.payload, pi, 12);
+		if (pass == 4)
+			b.payload[11] ^= 1;
+		sim_rx(&b);
+		run_ms(30);
+		for (unsigned v = 0; v < nv; v++) {
+			memset(&b, 0, sizeof(b));
+			b.kind = DMR_BURST_VOICE;
+			b.voice_index = air_i[v];
+			b.sync = air_i[v] == 0 ? (ras ? DMR_SYNC_BS : DMR_SYNC_MS) : DMR_SYNC_NONE;
+			b.cc = ras ? 9 : 1;
+			b.ts = ras ? 2 : 0;
+			b.crc_ok = true;
+			b.in_step = true;
+			b.len = 27;
+			memcpy(b.payload, air_v[v], 27);
+			sim_rx(&b);
+			run_ms(60);
+		}
+		CHECK(V()->caller.encrypted && V()->caller.pi_header == (pass != 4));
+		if (pass == 0)
+			CHECK(sink_log.frames == nv * 3 && sink_log.losts == 0 && memcmp(sink_log.first, first, 9) == 0 &&
+			      memcmp(sink_log.last, last, 9) == 0);
+		else if (ras)
+			CHECK(sink_log.frames == (nv - 5) * 3 && V()->caller.src == 0 && memcmp(sink_log.last, last, 9) == 0);
+		else
+			CHECK(sink_log.frames == 0);
+	}
+
+	// Late entry: the same bursts into a receiver that never heard the PI header. After each burst F the modem
+	// reports its single block (key ID 14 and algorithm); the fragments of each superframe then start the keystream
+	// from the next superframe's MI, so the first superframe stays silent and the rest plays. A single block with
+	// another key ID, or none at all, starts nothing
+	for (int pass = 0; pass < 3; pass++) {
+		uint8_t lc[9];
+
+		c = base_cfg();
+		c.cipher_alg = alg;
+		c.cipher_kid = 14;
+		c.cipher_key = key;
+		setup(&c);
+		mk_lc(lc, 0, TG_TALK, 9997030);
+		lc[1] = 0x10;
+		lc[2] = DMR_SVC_PRIVACY;
+		rx_header(lc, 1, 0, DMR_SYNC_MS, false);
+		run_ms(30);
+		for (unsigned v = 0; v < nv; v++) {
+			dmr_burst_t b;
+
+			memset(&b, 0, sizeof(b));
+			b.kind = DMR_BURST_VOICE;
+			b.voice_index = air_i[v];
+			b.sync = air_i[v] == 0 ? DMR_SYNC_MS : DMR_SYNC_NONE;
+			b.cc = 1;
+			b.crc_ok = true;
+			b.in_step = true;
+			b.len = 27;
+			memcpy(b.payload, air_v[v], 27);
+			sim_rx(&b);
+			run_ms(60);
+			if (air_i[v] == 5 && pass < 2) {
+				sim_rc((uint16_t)(((pass == 1 ? 15 : 14) << 3) | (alg & 7)), DMR_RC_EMBEDDED);
+				run_ms(30);
+			}
+		}
+		dmr_call_stats_t st;
+
+		dmr_call_get_stats(&st);
+		if (pass == 0) {
+			CHECK(st.rx_le_aes == 1);
+			// The first superframe's 6 bursts were concealed (3 frames each), the rest played
+			CHECK(sink_log.frames == (nv - 6) * 3 && sink_log.losts == 18);
+			// The first frame played is burst A of the second superframe, decrypted with the late-entry MI
+			dmr_aes_t le;
+			uint8_t want[27];
+
+			CHECK(air_i[6] == 0);
+			dmrVoiceCipherStart(&le, alg, key, dmrVoiceCipherNextMi(alg, mi));
+			memcpy(want, air_v[6], 27);
+			CHECK(dmrAesBurst(&le, want, 0, 0, dmr_ambe_silence));
+			CHECK(memcmp(sink_log.first, want, 9) == 0);
+			CHECK(memcmp(sink_log.last, last, 9) == 0);
+		} else {
+			CHECK(st.rx_le_aes == 0 && sink_log.frames == 0);
+		}
+	}
+
+	// The key ID set and its key missing: PTT refused, nothing on air
+	c = base_cfg();
+	c.cipher_alg = alg;
+	c.cipher_kid = 14;
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(400);
+	unsigned voice = 0;
+	for (unsigned i = 0; i < sim.air_count; i++)
+		voice += sim.air[i].kind == DMR_BURST_VOICE;
+	CHECK(voice == 0 && V()->tx_error == DMR_TX_ERR_REJECTED);
+	dmr_call_ptt(false);
+	run_ms(200);
+}
+#endif
+
+// GPS Info LC (TS 102 361-2 7.1.1, FLCO 8): vectors built by hand from the field layout
+static void test_gps_lc(void)
+{
+	// 45 N, 90 W, error < 20 m: longitude -90 * 2^25 / 360 = -0x800000 (25-bit 0x1800000), latitude 0x400000
+	static const uint8_t v1[9] = { 0x08, 0x00, 0x03, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00 };
+	// 33.8688 S, 151.2093 E, error < 2 km: 0x0D70DA0 and 0xCFD4BF
+	static const uint8_t v2[9] = { 0x08, 0x00, 0x06, 0xD7, 0x0D, 0xA0, 0xCF, 0xD4, 0xBF };
+	uint8_t lc[9];
+	dmr_gps_t g = { .err = 1, .lat = 450000000, .lon = -900000000 }, out;
+
+	dmr_gps_encode(&g, lc);
+	CHECK(memcmp(lc, v1, 9) == 0);
+	CHECK(dmr_gps_decode(v1, &out) && out.err == 1 && out.lat == 450000000 && out.lon == -900000000);
+	g = (dmr_gps_t){ .err = 3, .lat = -338688000, .lon = 1512093000 };
+	dmr_gps_encode(&g, lc);
+	CHECK(memcmp(lc, v2, 9) == 0);
+	CHECK(dmr_gps_decode(v2, &out) && out.err == 3);
+	CHECK(out.lat - g.lat <= 54 && g.lat - out.lat <= 54 && out.lon - g.lon <= 54 && g.lon - out.lon <= 54);
+	// The field ends: +90 / +180 clamp to the largest step, -90 / -180 are exact
+	g = (dmr_gps_t){ .err = 7, .lat = 900000000, .lon = 1800000000 };
+	dmr_gps_encode(&g, lc);
+	CHECK(lc[2] == 0x0E && lc[3] == 0xFF && lc[5] == 0xFF && lc[6] == 0x7F && lc[8] == 0xFF);
+	g = (dmr_gps_t){ .err = 0, .lat = -900000000, .lon = -1800000000 };
+	dmr_gps_encode(&g, lc);
+	CHECK(lc[2] == 0x01 && lc[3] == 0x00 && lc[6] == 0x80 && lc[7] == 0x00);
+	CHECK(dmr_gps_decode(lc, &out) && out.lat == -900000000 && out.lon == -1800000000);
+	// Not GPS Info: another FLCO, a manufacturer's FID, or 0, 0 (no fix)
+	memcpy(lc, v1, 9);
+	lc[0] = DMR_FLCO_TA_HEADER;
+	CHECK(!dmr_gps_decode(lc, &out));
+	memcpy(lc, v1, 9);
+	lc[1] = 0x10;
+	CHECK(!dmr_gps_decode(lc, &out));
+	static const uint8_t zero[9] = { 0x08, 0x00, 0x0E, 0, 0, 0, 0, 0, 0 };
+	CHECK(!dmr_gps_decode(zero, &out));
+	// The protect flag doesn't matter
+	memcpy(lc, v1, 9);
+	lc[0] |= 0x80;
+	CHECK(dmr_gps_decode(lc, &out));
+	// Error codes
+	CHECK(dmr_gps_err_code(0) == 7 && dmr_gps_err_code(1) == 0 && dmr_gps_err_code(2) == 1 &&
+	      dmr_gps_err_code(19) == 1 && dmr_gps_err_code(20) == 2 && dmr_gps_err_code(1999) == 3 &&
+	      dmr_gps_err_code(200000) == 5 && dmr_gps_err_code(200001) == 6);
+	CHECK(dmr_gps_err_m(1) == 20 && dmr_gps_err_m(5) == 200000 && dmr_gps_err_m(6) == 0 && dmr_gps_err_m(7) == 0);
+	// Range and bearing: one degree east on the equator (111.2 km, 90), 0.1 degree north at 45 N (11.12 km, 0),
+	// south-west, and across the date line
+	uint32_t m;
+	uint16_t b;
+	dmr_gps_range(0, 0, 0, 10000000, &m, &b);
+	CHECK(m > 111000 && m < 111400 && b == 90);
+	dmr_gps_range(450000000, -900000000, 451000000, -900000000, &m, &b);
+	CHECK(m > 11100 && m < 11140 && b == 0);
+	dmr_gps_range(337490000, -843880000, 336490000, -844880000, &m, &b);	// 0.1 S, 0.1 W at 33.7 N
+	CHECK(m > 14390 && m < 14540 && b >= 219 && b <= 221);	// 14.46 km, 219.8
+	dmr_gps_range(0, 1795000000, 0, -1795000000, &m, &b);
+	CHECK(m > 111000 && m < 111400 && b == 90);
+	dmr_gps_range(100, 100, 100, 100, &m, &b);
+	CHECK(m == 0 && b == 0);
+	// A latitude difference past 32 bits (no real position, but any int32 may arrive): converted whole, not cut
+	dmr_gps_range(INT32_MIN, 0, INT32_MAX, 0, &m, &b);
+	CHECK(m > 47750000 && m < 47766000 && b == 0);
+	dmr_gps_range(2000000000, 5, -2000000001, 0, &m, &b);
+	CHECK(m > 44470000 && m < 44486000 && b == 180);
+}
+
+// GPS Info on the air: a caller's position is collected per call (and kept with the last heard), ours rides in the
+// alias rotation
+static void test_gps_call(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9], gps[9], ta[4][9], got[20][9];
+	unsigned frame = 1;
+	dmr_gps_t g = { .err = 1, .lat = 450000000, .lon = -900000000 };
+	dmr_call_stats_t st;
+
+	dmr_gps_encode(&g, gps);
+	setup(&c);
+	mk_lc(lc, 0, TG_TALK, 9997030);
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	CHECK(!V()->caller.gps_valid);
+	for (int i = 0; i < 6; i++) {
+		rx_voice((uint8_t)i, 1, 0, DMR_SYNC_MS, &frame, i == 5 ? gps : NULL, false);
+		run_ms(60);
+	}
+	CHECK(V()->caller.gps_valid && V()->caller.gps.lat == g.lat && V()->caller.gps.lon == g.lon &&
+	      V()->caller.gps.err == 1);
+	dmr_call_get_stats(&st);
+	CHECK(st.rx_gps == 1);
+	rx_header(lc, 1, 0, DMR_SYNC_MS, true);	// terminator
+	run_ms(20);
+	CHECK(V()->last_heard.gps_valid && V()->last_heard.gps.lat == g.lat);
+	// A new talker starts without a position
+	mk_lc(lc, 0, TG_TALK, 9997006);
+	rx_call(lc, 1, true, 0, 1, false, &frame);
+	CHECK(V()->caller.src == 9997006 && !V()->caller.gps_valid);
+
+	// TX: GPS Info alone takes every other superframe
+	c = base_cfg();
+	setup(&c);
+	dmr_call_set_tx_gps(&g);
+	dmr_call_ptt(true);
+	run_ms(360 * 6);
+	dmr_call_ptt(false);
+	run_ms(1200);
+	mk_lc(lc, 0, TG_TALK, OWN_ID);
+	int sfs = air_superframe_lcs(got, 20);
+	CHECK(sfs >= 6);
+	for (int k = 0; k < sfs; k++)
+		CHECK(memcmp(got[k], (k & 1) ? gps : lc, 9) == 0);
+	dmr_call_get_stats(&st);
+	CHECK(st.tx_gps_lcs == (uint32_t)(sfs / 2) && st.tx_alias_lcs == 0);
+
+	// With a talker alias: header, block 1, block 2, GPS in the odd superframes
+	strcpy(c.tx_alias, "Q0TEST Charlie");
+	c.tx_alias_format = DMR_TA_ISO8;
+	setup(&c);
+	dmr_call_set_tx_gps(&g);
+	int n = dmr_ta_encode(c.tx_alias, DMR_TA_ISO8, ta);
+	memcpy(ta[n], gps, 9);
+	dmr_call_ptt(true);
+	run_ms(360 * 10);
+	dmr_call_ptt(false);
+	run_ms(1200);
+	sfs = air_superframe_lcs(got, 20);
+	CHECK(sfs >= 10);
+	for (int k = 0; k < sfs; k++)
+		CHECK(memcmp(got[k], (k & 1) ? ta[(k / 2) % (n + 1)] : lc, 9) == 0);
+	dmr_call_get_stats(&st);
+	CHECK(st.tx_gps_lcs >= 1 && st.tx_alias_lcs >= 3);
+
+	// Cleared: the voice LC only
+	c = base_cfg();
+	setup(&c);
+	dmr_call_set_tx_gps(NULL);
+	dmr_call_ptt(true);
+	run_ms(360 * 3);
+	dmr_call_ptt(false);
+	run_ms(1200);
+	sfs = air_superframe_lcs(got, 20);
+	CHECK(sfs >= 3);
+	for (int k = 0; k < sfs; k++)
+		CHECK(memcmp(got[k], lc, 9) == 0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// SFR user (docs/spec/sfr.md 4)
+
+// A call as a user of a single frequency repeater hears it: each burst from the talker on the inbound slot (TS1 sync
+// on burst A) and, 90 ms later, the repeater's copy on the outbound slot (TS2 sync). direct_until: the talker's copies
+// stop after this many bursts (out of range), -1 = all heard
+static void sfr_rx_call(const uint8_t lc[9], int superframes, int direct_until)
+{
+	int n = 3 + superframes * 6 + 1;	// headers, voice, terminator
+	unsigned fd = 1, fr = 1;
+
+	for (int step = 0; step < 2 * n + 3; step++) {	// 30 ms steps; burst k direct at step 2k, repeated at 2k + 3
+		for (int copy = 0; copy < 2; copy++) {
+			int k = copy == 0 ? step / 2 : (step - 3) / 2;
+			bool due = copy == 0 ? (step % 2 == 0) : (step >= 3 && (step - 3) % 2 == 0);
+
+			if (!due || k >= n || (copy == 0 && direct_until >= 0 && k >= direct_until))
+				continue;
+			int8_t ts = copy == 0 ? 1 : 2;
+			uint8_t sync = copy == 0 ? DMR_SYNC_TS1 : DMR_SYNC_TS2;
+			unsigned *f = copy == 0 ? &fd : &fr;
+
+			if (k < 3) {
+				rx_header(lc, 1, ts, sync, false);
+			} else if (k < n - 1) {
+				int v = (k - 3) % 6;
+
+				rx_voice((uint8_t)v, 1, ts, sync, f, v == 5 ? lc : NULL, false);
+			} else {
+				rx_header(lc, 1, ts, sync, true);
+			}
+		}
+		run_ms(30);
+	}
+}
+
+static void test_sfr_user(void)
+{
+	dmr_call_config_t c = base_cfg();
+	uint8_t lc[9];
+	dmr_call_stats_t st;
+
+	mk_lc(lc, DMR_FLCO_GROUP_VOICE, TG_LIST, 9997030);
+
+	// Without the SFR role, the repeat on the other slot is dropped (the TDMA direct mode sync names it)
+	setup(&c);
+	sfr_rx_call(lc, 2, -1);
+	dmr_call_get_stats(&st);
+	CHECK(sink_log.begins == 1 && sink_log.frames == 36 && sink_log.losts == 0);
+	CHECK(st.rx_ts_dropped >= 12 && st.rx_sfr_dup == 0);
+
+	// SFR user hearing the repeat only (the default): the talker's copy is dropped, the repeat plays in full
+	c.sfr_user = true;
+	c.tx_sync = DMR_SYNC_TS1;
+	c.rx_sync = DMR_SYNC_TS2;
+	setup(&c);
+	sfr_rx_call(lc, 2, -1);
+	dmr_call_get_stats(&st);
+	CHECK(sink_log.begins == 1 && sink_log.ends == 1 && sink_log.frames == 36 && sink_log.losts == 0);
+	for (unsigned i = 0; i < 36; i++)
+		CHECK(sink_log.seq[i] == (uint8_t)(i + 1));	// the repeat's own numbering: no talker frame played
+	CHECK(st.rx_sfr_direct == 3 + 12 + 1 && st.rx_sfr_dup == 0 && st.rx_calls == 1);
+
+	// ... and with only the talker in range, nothing plays
+	setup(&c);
+	{
+		unsigned f = 1;
+
+		for (int h = 0; h < 3; h++) {
+			rx_header(lc, 1, 1, DMR_SYNC_TS1, false);
+			run_ms(60);
+		}
+		for (int i = 0; i < 12; i++) {
+			rx_voice((uint8_t)(i % 6), 1, 1, DMR_SYNC_TS1, &f, i % 6 == 5 ? lc : NULL, false);
+			run_ms(60);
+		}
+	}
+	dmr_call_get_stats(&st);
+	CHECK(sink_log.begins == 0 && sink_log.frames == 0 && st.rx_calls == 0 && st.rx_sfr_direct == 15);
+
+	// Both, first arrival: each voice burst played once, in order, nothing concealed
+	c.sfr_rx = DMR_SFR_RX_FIRST;
+	setup(&c);
+	sfr_rx_call(lc, 2, -1);
+	dmr_call_get_stats(&st);
+	CHECK(sink_log.begins == 1 && sink_log.ends == 1 && sink_log.frames == 36 && sink_log.losts == 0);
+	for (unsigned i = 0; i < 36; i++)
+		CHECK(sink_log.seq[i] == (uint8_t)(i + 1));
+	CHECK(st.rx_ts_dropped == 0 && st.rx_sfr_dup == 12 && st.rx_calls == 1);
+	run_ms(600);
+	CHECK(V()->state == DMR_CALL_STATE_IDLE && sink_log.begins == 1);	// the repeat's tail started no second call
+
+	// The talker fades out after the headers and burst C: the repeat carries the rest, still nothing concealed
+	setup(&c);
+	sfr_rx_call(lc, 2, 3 + 3);
+	CHECK(sink_log.begins == 1 && sink_log.frames == 36 && sink_log.losts == 0);
+	for (unsigned i = 0; i < 36; i++)
+		CHECK(sink_log.seq[i] == (uint8_t)(i + 1));
+
+	// Only the repeat heard (the talker out of range): a normal call on the outbound slot
+	setup(&c);
+	sfr_rx_call(lc, 1, 0);
+	CHECK(sink_log.begins == 1 && sink_log.frames == 18 && sink_log.losts == 0);
+
+	// TX: on the inbound slot with its TDMA direct mode sync; own timing with no repeater heard, impolite (the
+	// repeater's hang would make a polite modem refuse)
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(400);
+	dmr_call_ptt(false);
+	run_ms(800);
+	CHECK(sim.tx_begins == 1 && sim.first_timing == DMR_TIMING_OWN && sim.first_ts == 1);
+	CHECK(sim.last_access == DMR_ACCESS_IMPOLITE);
+	CHECK(sim.air_count > 4);
+	for (unsigned i = 0; i < sim.air_count; i++)
+		CHECK(sim.air[i].sync == DMR_SYNC_TS1);
+
+	// The repeater's hang heard just now (idle bursts with TS2 sync): keyed in step with its slots, on TS1
+	setup(&c);
+	{
+		dmr_burst_t b;
+
+		memset(&b, 0, sizeof(b));
+		b.kind = DMR_BURST_IDLE;
+		b.sync = DMR_SYNC_TS2;
+		b.ts = 2;
+		b.cc = 1;
+		b.crc_ok = true;
+		b.in_step = true;
+		sim_rx(&b);
+	}
+	run_ms(60);
+	dmr_call_ptt(true);
+	run_ms(100);
+	CHECK(sim.tx_begins == 1 && sim.first_timing == DMR_TIMING_ALIGNED && sim.first_ts == 1);
+	dmr_call_ptt(false);
+	run_ms(800);
+	// ... but not once it has been quiet longer than the modem keeps slot timing
+	run_ms(DMR_CALL_ALIGN_MS);
+	sim.tx_begins = 0;
+	dmr_call_ptt(true);
+	run_ms(100);
+	CHECK(sim.tx_begins == 1 && sim.last_timing == DMR_TIMING_OWN);
+	dmr_call_ptt(false);
+	run_ms(800);
+
+	// Plain DMO keeps MS sync
+	c.sfr_user = false;
+	setup(&c);
+	dmr_call_ptt(true);
+	run_ms(200);
+	dmr_call_ptt(false);
+	run_ms(800);
+	CHECK(sim.air_count > 0 && sim.air[0].sync == DMR_SYNC_NONE);
+
+	// ERDM user: the repeater's outbound color code is heard too; the modem passes every color code to the stack
+	c = base_cfg();
+	c.sfr_user = true;
+	c.tx_sync = DMR_SYNC_MS;
+	c.cc2 = 5;
+	setup(&c);
+	CHECK(sim.cc_filter == -1);
+	{
+		unsigned f = 1;
+
+		rx_header(lc, 5, 2, DMR_SYNC_BS, false);
+		run_ms(60);
+		for (int i = 0; i < 6; i++) {
+			rx_voice((uint8_t)i, 5, 2, DMR_SYNC_BS, &f, i == 5 ? lc : NULL, false);
+			run_ms(60);
+		}
+		rx_header(lc, 7, 2, DMR_SYNC_BS, false);	// a third color code: not ours
+	}
+	run_ms(60);
+	dmr_call_get_stats(&st);
+	CHECK(sink_log.begins == 1 && sink_log.frames == 18 && st.rx_cc_dropped == 1);
+}
+
+#if CONFIG_SFR_DUALPATH_RX
+// Dual-path RX needs real voice frames: frame n of the call is the FEC encoding of parameters made from n, and a bad copy of
+// it has four bits of its C0 word flipped (detected, not corrected: the vocoder would conceal it)
+static void dual_frame(unsigned n, bool bad, uint8_t out[9])
+{
+	uint8_t bits[AMBE_PARAM_BITS];
+
+	for (int j = 0; j < AMBE_PARAM_BITS; j++)
+		bits[j] = (uint8_t)(((n * 2654435761u) >> (j % 29)) & 1u);
+	ambeFecEncode(bits, out);
+	if (bad) {
+		uint32_t c[4];
+
+		ambeDeinterleave(out, c);
+		c[0] ^= 0xC00030u;	// bits that land in the first octet (the sink log keeps it)
+		ambeInterleave(c, out);
+	}
+}
+
+// One SFR call, as in sfr_rx_call, with real frames. bad_direct / bad_repeat: bit k = burst k's frame 1 is bad in
+// that copy. repeat: the repeater is heard
+static void sfr_dual_call(int superframes, uint32_t bad_direct, uint32_t bad_repeat, bool repeat)
+{
+	uint8_t lc[9];
+	int n = 3 + superframes * 6 + 1;
+
+	mk_lc(lc, DMR_FLCO_GROUP_VOICE, TG_LIST, 9997030);
+	for (int step = 0; step < 2 * n + 3; step++) {
+		for (int copy = 0; copy < 2; copy++) {
+			int k = copy == 0 ? step / 2 : (step - 3) / 2;
+			bool due = copy == 0 ? (step % 2 == 0) : (step >= 3 && (step - 3) % 2 == 0);
+
+			if (!due || k >= n || (copy == 1 && !repeat))
+				continue;
+			int8_t ts = copy == 0 ? 1 : 2;
+			uint8_t sync = copy == 0 ? DMR_SYNC_TS1 : DMR_SYNC_TS2;
+
+			if (k < 3 || k == n - 1) {
+				rx_header(lc, 1, ts, sync, k == n - 1);
+				continue;
+			}
+			int v = k - 3;
+			dmr_burst_t b;
+
+			memset(&b, 0, sizeof(b));
+			b.kind = DMR_BURST_VOICE;
+			b.voice_index = (uint8_t)(v % 6);
+			b.sync = v % 6 == 0 ? sync : DMR_SYNC_NONE;
+			b.cc = 1;
+			b.ts = ts;
+			b.crc_ok = true;
+			b.in_step = true;
+			b.len = 27;
+			uint32_t bad = copy == 0 ? bad_direct : bad_repeat;
+
+			for (int f = 0; f < 3; f++)
+				dual_frame((unsigned)(v * 3 + f), f == 1 && ((bad >> v) & 1u), &b.payload[f * 9]);
+			if (v % 6 == 5) {
+				b.lc_valid = true;
+				memcpy(b.lc, lc, 9);
+			}
+			sim_rx(&b);
+		}
+		run_ms(30);
+	}
+	run_ms(600);
+}
+
+// The frames played are the good ones, in order
+static bool dual_played_good(unsigned frames)
+{
+	if (sink_log.frames != frames || sink_log.losts != 0)
+		return false;
+	for (unsigned i = 0; i < frames; i++) {
+		uint8_t g[9];
+
+		dual_frame(i, false, g);
+		if (sink_log.seq[i] != g[0])
+			return false;
+	}
+	return true;
+}
+
+static void test_sfr_dualpath_rx(void)
+{
+	dmr_call_config_t c = base_cfg();
+	dmr_call_stats_t st;
+	uint8_t g[9], b[9];
+	ambe_fec_result_t r;
+	uint8_t bits[AMBE_PARAM_BITS];
+
+	// The test's bad frame: C0 fails, and its first octet differs from the good one's (what the sink log keeps)
+	dual_frame(4, false, g);
+	dual_frame(4, true, b);
+	ambeFecDecode(b, bits, &r);
+	CHECK(r.c0_failed && g[0] != b[0]);
+
+	c.sfr_user = true;
+	c.tx_sync = DMR_SYNC_TS1;
+	c.rx_sync = DMR_SYNC_TS2;
+	c.sfr_rx = DMR_SFR_RX_DUALPATH;
+
+	// Bursts B and E of the talker's copy have a bad frame, the repeat's are good: those frames come from the repeat
+	setup(&c);
+	sfr_dual_call(2, (1u << 1) | (1u << 4), 0, true);
+	dmr_call_get_stats(&st);
+	CHECK(sink_log.begins == 1 && sink_log.ends == 1 && dual_played_good(36));
+	CHECK(st.rx_sfr_held == 2 && st.rx_sfr_fixed == 2 && st.rx_sfr_dup == 12);
+
+	// The repeat bad where the talker's copy is good: nothing held (the first copy decodes), the talker's played
+	setup(&c);
+	sfr_dual_call(2, 0, (1u << 2), true);
+	dmr_call_get_stats(&st);
+	CHECK(dual_played_good(36) && st.rx_sfr_held == 0 && st.rx_sfr_fixed == 0);
+
+	// Both copies bad in the same burst: held, then played as it is (the vocoder conceals the frame)
+	setup(&c);
+	sfr_dual_call(1, 1u << 3, 1u << 3, true);
+	dmr_call_get_stats(&st);
+	CHECK(sink_log.frames == 18 && st.rx_sfr_held == 1 && st.rx_sfr_fixed == 0);
+	dual_frame(3 * 3 + 1, true, b);
+	CHECK(sink_log.seq[3 * 3 + 1] == b[0]);
+
+	// No repeat heard: a bad burst waits DMR_SFR_DUALPATH_MS, then plays; the call keeps its order and every frame
+	setup(&c);
+	sfr_dual_call(2, 1u << 1, 0, false);
+	dmr_call_get_stats(&st);
+	CHECK(sink_log.begins == 1 && sink_log.frames == 36 && sink_log.losts == 0 && st.rx_sfr_held == 1);
+	dual_frame(4, true, b);
+	CHECK(sink_log.seq[4] == b[0] && sink_log.seq[5] != b[0]);
+	for (unsigned i = 0; i < 36; i++) {
+		dual_frame(i, false, g);
+		if (i != 4)
+			CHECK(sink_log.seq[i] == g[0]);
+	}
+
+	// First arrival doesn't fix anything: the talker's bad frame is played
+	c.sfr_rx = DMR_SFR_RX_FIRST;
+	setup(&c);
+	sfr_dual_call(2, 1u << 1, 0, true);
+	dmr_call_get_stats(&st);
+	CHECK(sink_log.frames == 36 && st.rx_sfr_held == 0 && st.rx_sfr_fixed == 0);
+	dual_frame(4, true, b);
+	CHECK(sink_log.seq[4] == b[0]);
+}
+#endif
+
+int main(void)
+{
+	test_lc_pack();
+	test_rs129();
+	test_csbk();
+	test_embedded();
+	test_alias();
+	test_tx_call();
+	test_tx_permit_hold();
+	test_tx_timeout_and_starve();
+	test_tx_rc_cease();
+	test_tx_refused();
+	test_tx_done_wake();
+	test_tx_modem_stalled();
+	test_rmo_wakeup();
+	test_rmo_air_slot_alignment();
+	test_rmo_hang_end();
+	test_rmo_up_from_bursts();
+	test_rmo_wake_lost();
+	test_rmo_drop_before_first_burst();
+	test_rmo_drop_under_over();
+	test_rmo_listen_gaps();
+	test_rmo_data_after_listened_over();
+	test_rmo_start_stalled();
+	test_rx_call();
+	test_rx_filters();
+	test_rx_recheck_on_configure();
+	test_rx_no_call_after_terminator();
+	test_rx_ras_voice_without_lc();
+	test_rx_monitor_any_cc_ts();
+	test_slot_change_keeps_modem();
+	test_rx_group_callback();
+	test_rx_own_id_parrot();
+	test_rx_resumed_call();
+	test_late_entry();
+	test_alias_and_privacy();
+	test_privacy_hook();
+	test_emergency_tx();
+	test_impolite_over_call();
+	test_modem_color_code();
+	test_reconfigure();
+	test_monitor_both_slots();
+	test_tx_alias();
+	test_alias_formats();
+	test_pi_header_and_emergency();
+	test_private_calls();
+	test_basic_privacy();
+#if CONFIG_AIR_AES
+	test_cipher(DMR_AES_ALG);
+	test_cipher(DMR_ARC4_ALG);
+#endif
+	test_gps_lc();
+	test_gps_call();
+	test_sfr_user();
+#if CONFIG_SFR_DUALPATH_RX
+	test_sfr_dualpath_rx();
+#endif
+	printf("# dmrCallTest: %d checks, %d failures\n", checks, failures);
+	return failures ? 1 : 0;
+}

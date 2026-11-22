@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 The RadioFoundry Authors
+// The UI's behavior without the RTOS: one navigation stack of screens, logical actions in, drawing out
+// (docs/ux/information-architecture.md, docs/spec/ui.md). ui.c runs it in the UI task; the host simulator
+// (tests/host/sim/ui_sim.c) runs the same code against a simulated radio, codeplug and display.
+#ifndef UI_APP_H
+#define UI_APP_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "hal_input.h"
+#include "radio/radio.h"
+
+// Call once after gfx_init and ui_layout_init (reads the board's key map for fallbacks and hint texts)
+void ui_app_init(void);
+// One logical input event (PTT / MONITOR edges included: the radio core gets those from the input layer directly)
+void ui_app_key(const input_event_t *ev);
+// Time passes and the radio view may have changed: timeouts, banners, Recent. True if the screen should be redrawn
+bool ui_app_tick(const radio_view_t *v, uint32_t now_ms);
+// Draw the current screen into the frame buffer (no flush)
+void ui_app_draw(void);
+// Backlight percent the user chose (Quick settings / Settings > Display); the dim and off times are the radio's
+// settings (ui_svc_apply)
+uint8_t ui_app_brightness(void);
+// CONFIG_BACKLIGHT_TEST: the percent the backlight tests hold the light at (the task writes no other), -1 when not held
+int16_t ui_app_backlight_hold(void);
+// The hold ended since the last call (then cleared): the task writes its own level again
+bool ui_app_take_backlight_reapply(void);
+// A banner or the emergency screen came up since the last call (then cleared): the backlight comes on for it
+bool ui_app_take_wake(void);
+// Auto power off is due (Settings > Power saving > Auto power off): the housekeeping task switches the radio off. If
+// the supply stays on, it queues UI_EV_POWER_OFF_FAILED (ui_notify) and the UI goes to soft off instead. Any task
+bool ui_app_power_off_due(void);
+// Soft off: auto power off couldn't switch the radio off (the knob holds the supply), so the radio went quiet
+// instead — black screen, receiver asleep, any key wakes it. The UI task's backlight stays off while it holds
+bool ui_app_soft_off(void);
+
+// For the debug link and the simulator: what is on screen
+typedef struct {
+	const char *screen;	// "home", "quick", "hub", "find", ...
+	uint8_t depth;		// 0 = Home
+	uint16_t focus;		// focused row / tile
+	uint16_t count;		// rows on a list screen
+	bool locked;
+	const char *unlock_key;	// the key held to unlock: "quick", "back", or "none" (auto lock never locks then)
+	bool field_use;		// the screen is tagged "field use" (depth rule, usability-tests.md 2)
+	const char *banner;	// banner title, "" = none
+	const char *toast;	// "" = none
+	const char *query;	// Find text so far, "" = none
+	uint32_t draws;		// frames drawn so far
+	bool strip_drawn;	// the last frame drew the status strip with the state pill or a merged title (P2)
+	bool dual;		// the UI runs dual watch: it has taken over a watch the debug link started
+	int8_t volbar;		// the knob's volume bar shows this step, -1 = not shown
+	bool volbar_top;	// ... in the status strip: the last frame drew no hint row
+} ui_app_status_t;
+void ui_app_status(ui_app_status_t *st);
+// The label of the focused row on a list screen ("" otherwise), for scripted checks
+const char *ui_app_focus_label(void);
+
+#endif
